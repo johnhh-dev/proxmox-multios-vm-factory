@@ -1,54 +1,63 @@
 
 # 🏗 Proxmox VM Factory Lab
 
-Terraform‑drevet VM‑provisjonering i **Proxmox** med automatisk **Azure Arc onboarding**, styrt via **GitHub Actions**.
+A **GitOps-driven VM factory** for provisioning virtual machines on **Proxmox VE** using **Terraform**, with automatic **Azure Arc onboarding** and CI/CD through **GitHub Actions**.
 
-Dette repoet implementerer en **GitOps‑drevet VM factory** for et hjemmelabmiljø. Virtuelle maskiner opprettes i Proxmox, konfigureres via cloud‑init / cloudbase‑init og onboardes automatisk til Azure Arc.
-
----
-
-# 📐 Arkitekturoversikt
-
-GitHub Repo  
-↓  
-GitHub Actions (terraform plan/apply)  
-↓  
-Self‑hosted Runner  
-↓  
-Proxmox API  
-↓  
-VM clone fra template  
-↓  
-cloud‑init / cloudbase‑init  
-↓  
-Azure Arc agent install  
-↓  
-Azure Arc
+This lab demonstrates how to build a reproducible infrastructure platform where VMs are declared as code and automatically provisioned, configured, and registered in Azure Arc.
 
 ---
 
-# 🖥 Infrastrukturplattform
+# 📐 Architecture Overview
 
-**Hypervisor**
-- Proxmox VE
+```mermaid
+flowchart TD
+
+A[GitHub Repository] --> B[GitHub Actions]
+B --> C[Self-hosted Runner]
+C --> D[Terraform]
+
+D --> E[Proxmox API]
+E --> F[VM Clone from Template]
+
+F --> G[cloud-init / cloudbase-init]
+G --> H[Install Azure Arc Agent]
+H --> I[Azure Arc]
+
+```
+
+---
+
+# 🖥 Infrastructure Platform
+
+**Hypervisor**  
+Proxmox VE
 
 **Node**
-- `pve`
+
+```
+pve
+```
 
 **Storage**
-- `local` → cloud‑init snippets  
-- `local-lvm` → VM disks
+
+```
+local       → cloud-init snippets
+local-lvm   → VM disks
+```
 
 **Network**
-- `vmbr0`
+
+```
+vmbr0
+```
 
 ---
 
-# 🧠 VM Factory Design
+# 🧠 VM Factory Concept
 
-VM‑er defineres i Terraform via en inventory‑struktur i `locals.tf`.
+VMs are defined declaratively in Terraform.
 
-Eksempel:
+Example from `locals.tf`:
 
 ```hcl
 vms = {
@@ -68,22 +77,29 @@ vms = {
 }
 ```
 
+Terraform converts this configuration into:
+
+1. Proxmox VM provisioning
+2. Cloud-init configuration
+3. Azure Arc onboarding
+
 ---
 
-# ⚙️ Funksjonalitet
+# ⚙️ Supported Features
 
 | Feature | Supported |
-|-------|------|
-Linux VM | ✅ |
-Windows VM | ✅ |
+|------|------|
+Linux VMs | ✅ |
+Windows VMs | ✅ |
 DHCP networking | ✅ |
-Static IP | ✅ |
+Static IP configuration | ✅ |
 Azure Arc onboarding | ✅ |
 Arc disabled | ✅ |
+GitOps deployment | ✅ |
 
 ---
 
-# 📦 Terraform struktur
+# 📦 Terraform Repository Structure
 
 ```
 .
@@ -111,17 +127,17 @@ Arc disabled | ✅ |
 
 ---
 
-# ☁ Azure Arc
+# ☁ Azure Arc Integration
 
-VM‑er onboardes til Azure via:
+VMs are connected to Azure using the Azure Arc agent.
 
 ```
 azcmagent connect
 ```
 
-Autentisering skjer via **Service Principal** lagret som GitHub secrets.
+Authentication is performed using a **Service Principal** stored as GitHub Secrets.
 
-Secrets brukt:
+Required secrets:
 
 ```
 TF_VAR_arc_sp_id
@@ -135,15 +151,15 @@ TF_VAR_arc_cloud
 
 ---
 
-# 🔐 Service Principal
+# 🔐 Service Principal Permissions
 
-Service Principal må ha:
+The Service Principal requires the following role:
 
 ```
 Contributor
 ```
 
-på resource group:
+Assigned to the resource group:
 
 ```
 rg-arc-vm-factory
@@ -151,43 +167,43 @@ rg-arc-vm-factory
 
 ---
 
-# 🔄 Deployment workflow
+# 🔄 Deployment Workflow
 
-Ved push til `main`:
+When pushing to the `main` branch:
 
 ```
 terraform init
 terraform plan
 terraform show tfplan
-cleanup old Arc resources
+cleanup Arc resources
 terraform apply
 ```
 
-Resultat:
+Result:
 
-1. VM opprettes i Proxmox  
-2. cloud‑init kjører  
-3. Azure Arc agent installeres  
-4. VM vises i Azure Portal
+1. Terraform clones a VM from the template in Proxmox
+2. cloud-init or cloudbase-init configures the VM
+3. Azure Arc agent is installed
+4. The VM appears in Azure Arc
 
 ---
 
-# 🗑 Destroy workflow
+# 🗑 Destroy Workflow
 
-Ved destroy:
+When infrastructure is destroyed:
 
 ```
 terraform destroy
 ```
 
-Workflow gjør:
+The pipeline performs:
 
-1. Leser terraform state  
-2. Finner Arc‑enabled VM‑er  
-3. Sletter Arc resources  
-4. Destroyer VM i Proxmox
+1. Reads Terraform state
+2. Detects Arc-enabled machines
+3. Deletes Azure Arc machine resources
+4. Removes VMs from Proxmox
 
-Resultat:
+Result:
 
 ```
 No orphan Azure Arc resources
@@ -195,46 +211,46 @@ No orphan Azure Arc resources
 
 ---
 
-# 📊 Status
+# 📊 Current Lab Status
 
 | Component | Status |
-|-----------|--------|
-Proxmox API | ✅ |
-Terraform | ✅ |
-Self‑hosted runner | ✅ |
-Persistent state | ✅ |
-Static IP support | ✅ |
-Azure Arc auto‑connect | ✅ |
-Arc cleanup | ✅ |
+|------|------|
+Proxmox API integration | ✅ |
+Terraform provisioning | ✅ |
+Self-hosted GitHub runner | ✅ |
+Persistent Terraform state | ✅ |
+Static networking | ✅ |
+Azure Arc auto onboarding | ✅ |
+Arc cleanup logic | ✅ |
 CI/CD pipeline | ✅ |
 
 ---
 
-# 🧠 Designvalg
+# 🧠 Design Decisions
 
-Terraform state lagres på runner:
+Terraform state is stored on the runner:
 
 ```
 /opt/terraform-state/proxmox-ubuntu-vm-factory
 ```
 
-Arc opprettes via cloud‑init ved provisioning.
+Azure Arc onboarding occurs during VM provisioning.
 
 ```
 arc = true
 ```
 
-Hvis Arc settes til false etter deploy må VM reconnectes eller reprovisioneres.
+If Arc is disabled later, the VM must be disconnected manually or reprovisioned.
 
 ---
 
-# 🚀 Mulige neste steg
+# 🚀 Possible Future Improvements
 
-- Windows template pipeline  
-- MicroK8s cluster provisioning  
-- Terraform modules for VM profiles  
-- Azure Policy via Arc  
-- Automated patching via Azure Update Manager  
+• Windows template automation  
+• MicroK8s cluster provisioning  
+• Terraform modules for VM profiles  
+• Azure Policy governance via Arc  
+• Automated patching via Azure Update Manager  
 
 ---
 
