@@ -1,54 +1,61 @@
 
-# 🏗 Hybrid Proxmox + Azure Arc Lab
+# 🏗 Hybrid Azure Arc + Proxmox + Kubernetes Lab
 
-A **hybrid infrastructure lab** built to practice **Azure Arc, Kubernetes, GitOps, and DevOps automation** using a local **Proxmox environment** integrated with **Microsoft Azure**.
+A **hybrid cloud lab environment** built to practice **Azure Arc, Kubernetes, Terraform, and DevOps automation** using a local **Proxmox infrastructure** integrated with **Microsoft Azure**.
 
-This lab simulates a **real hybrid cloud environment** where on‑prem servers and Kubernetes clusters are managed from Azure using **Azure Arc**.
+This lab simulates a **real-world hybrid architecture** where on‑premises virtual machines and Kubernetes clusters are managed from Azure using **Azure Arc**.
 
-The environment is designed to support learning for:
+The environment is designed to support learning and experimentation for:
 
 - **AZ‑104 – Azure Administrator**
-- **AZ‑400 – Azure DevOps Engineer**
+- **AZ‑400 – DevOps Engineer**
+- Hybrid infrastructure design
+- Kubernetes operations
+- Infrastructure as Code
 
 ---
 
-# 📐 Architecture Overview
+# 🎯 Lab Objectives
+
+This lab focuses on practicing:
+
+• Hybrid cloud architecture  
+• Azure Arc server management  
+• Azure Arc Kubernetes integration  
+• Terraform infrastructure automation  
+• GitHub Actions CI/CD pipelines  
+• Kubernetes application delivery with **ArgoCD**  
+
+Infrastructure provisioning and lifecycle is handled by **Terraform + GitHub Actions**, while **ArgoCD manages Kubernetes applications**.
+
+---
+
+# 📐 High-Level Architecture
 
 ```mermaid
 flowchart TD
 
-A[GitHub Repository] --> B[GitHub Actions]
+A[GitHub Repository] --> B[GitHub Actions CI/CD]
 B --> C[Self-hosted Runner]
+
 C --> D[Terraform VM Factory]
 
 D --> E[Proxmox VE]
-E --> F[VM Templates]
+E --> F[Virtual Machines]
 
-F --> G[Linux / Windows VMs]
-G --> H[MicroK8s Kubernetes Cluster]
+F --> G[MicroK8s Kubernetes Cluster]
 
-G --> I[Azure Arc Agent]
-H --> J[Azure Arc Kubernetes]
+F --> H[Azure Arc Agent]
+G --> I[Azure Arc Kubernetes]
 
-I --> K[Azure Arc Servers]
+H --> J[Azure Arc Servers]
 
-K --> L[Azure Resource Group]
-J --> L
+J --> K[Azure Resource Group]
+I --> K
 
-L --> M[Flux GitOps]
+G --> L[ArgoCD]
+L --> M[Kubernetes Applications]
 ```
-
----
-
-# 🎯 Lab Goals
-
-This lab is used to practice:
-
-• Azure Arc hybrid management  
-• Kubernetes cluster management  
-• GitOps deployments with Flux / ArgoCD  
-• Terraform infrastructure automation  
-• Hybrid cloud architecture design  
 
 ---
 
@@ -68,16 +75,15 @@ Norway East
 
 Azure is used for:
 
-- Azure Arc management
-- Kubernetes Arc integration
-- GitOps deployments
-- Cluster Connect
-- Hybrid server management
-- Policy and governance
+• Azure Arc server management  
+• Azure Arc Kubernetes integration  
+• Cluster Connect  
+• Policy & governance  
+• Monitoring and hybrid management  
 
 ---
 
-# 🖥 On‑Prem Infrastructure (Proxmox)
+# 🖥 On‑Prem Infrastructure
 
 Hypervisor:
 
@@ -106,11 +112,11 @@ local-lvm   → VM disks
 
 ---
 
-# 🧠 VM Factory (Terraform)
+# 🧠 Terraform VM Factory
 
-VM provisioning is fully automated using Terraform.
+VM provisioning is fully automated using **Terraform**.
 
-Infrastructure is declared as code and deployed via **GitHub Actions**.
+Terraform configuration defines VM specifications and automatically deploys machines to Proxmox using the Proxmox API.
 
 Example VM definition:
 
@@ -139,21 +145,21 @@ Supported features:
 Linux VM | ✅ |
 Windows VM | ✅ |
 DHCP networking | ✅ |
-Static IP | ✅ |
+Static IP configuration | ✅ |
 Azure Arc onboarding | ✅ |
-GitOps deployments | ✅ |
+GitHub Actions CI/CD | ✅ |
 
 ---
 
 # 🖥 Virtual Machines
 
-The lab contains three main virtual machines.
+The lab currently contains three main VMs.
 
 | VM | Role | Description |
 |----|------|-------------|
-microk8s-01 | Kubernetes node | Runs MicroK8s cluster |
-ubuntu-utils-01 | Tools server | Azure CLI, Terraform, DNS |
-win-admin-01 | Windows admin | Arc-enabled Windows management VM |
+microk8s-01 | Kubernetes node | Runs the MicroK8s cluster |
+ubuntu-utils-01 | Utility server | Azure CLI, Terraform, DNS |
+win-admin-01 | Windows admin | Arc‑enabled Windows management server |
 
 ---
 
@@ -167,11 +173,13 @@ microk8s-01
 
 Installed components:
 
-- MicroK8s
-- Ingress Controller
-- MetalLB
-- Azure Arc agents
-- ArgoCD
+• MicroK8s  
+• Ingress Controller  
+• MetalLB  
+• Azure Arc agents  
+• **ArgoCD**  
+
+ArgoCD is used for **Kubernetes application delivery**.
 
 ---
 
@@ -179,28 +187,28 @@ Installed components:
 
 The MicroK8s cluster is connected to Azure using **Azure Arc for Kubernetes**.
 
-Check connection status:
+Verify connection:
 
 ```
 az connectedk8s show -g rg-arc-home-lab -n microk8s-01
 ```
 
-Arc deploys the following agents into the cluster:
+Arc installs the following agents:
 
-- clusterconnect-agent
-- kube-aad-proxy
-- extension-manager
-- config-agent
-- metrics-agent
-- resource-sync-agent
+• clusterconnect-agent  
+• kube-aad-proxy  
+• extension-manager  
+• config-agent  
+• metrics-agent  
+• resource-sync-agent  
 
-These enable Azure to manage and monitor the Kubernetes cluster.
+These allow Azure to manage and monitor the Kubernetes cluster.
 
 ---
 
 # ☁ Azure Arc – Servers
 
-Two virtual machines are connected as **Arc-enabled servers**.
+Two machines are connected as **Arc-enabled servers**.
 
 | Server | OS |
 |------|------|
@@ -213,51 +221,51 @@ Check status:
 az connectedmachine list -g rg-arc-home-lab
 ```
 
-Azure Arc enables:
+Capabilities include:
 
-- Remote management
-- Policy enforcement
-- Monitoring
-- Update management
+• Remote management  
+• Policy enforcement  
+• Monitoring  
+• Update management  
 
 ---
 
-# 🌐 DNS
+# 🌐 DNS & Utility Services
 
-DNS services run on:
+DNS and administrative tooling run on:
 
 ```
 ubuntu-utils-01
 ```
 
-This server also hosts:
+This machine hosts:
 
-- Azure CLI
-- Terraform
-- management utilities
+• Azure CLI  
+• Terraform  
+• DNS services  
+• general admin tools  
 
 ---
 
-# 🔄 CI/CD Pipeline
+# 🔄 Infrastructure CI/CD
 
-Infrastructure changes are deployed through GitHub Actions.
+Infrastructure changes are deployed through **GitHub Actions**.
 
-Pipeline flow:
+Pipeline workflow:
 
 ```
 terraform init
 terraform plan
 terraform show tfplan
-cleanup old Arc resources
 terraform apply
 ```
 
-Results:
+Deployment process:
 
-1. Terraform provisions VMs in Proxmox
-2. cloud-init configures the OS
-3. Azure Arc agent installs automatically
-4. Machines appear in Azure Arc
+1. Terraform provisions VMs in Proxmox  
+2. cloud-init configures the operating system  
+3. Azure Arc agent installs automatically  
+4. Machines appear in Azure Arc  
 
 ---
 
@@ -269,12 +277,12 @@ When infrastructure is destroyed:
 terraform destroy
 ```
 
-The workflow:
+The pipeline:
 
-1. Reads Terraform state
-2. Finds Arc-enabled machines
-3. Deletes Arc resources
-4. Removes VMs from Proxmox
+1. Reads Terraform state  
+2. Detects Arc-enabled machines  
+3. Deletes Azure Arc resources  
+4. Removes VMs from Proxmox  
 
 Result:
 
@@ -304,23 +312,19 @@ No orphan Azure Arc resources
     │   ├── terraform-plan.yml
     │   ├── terraform-apply.yml
     │   └── terraform-destroy.yml
-    │
-    └── scripts/
-        ├── extract_arc_names_from_plan.py
-        └── extract_arc_names_from_state.py
 ```
 
 ---
 
 # 🧠 Design Decisions
 
-Terraform state is stored locally on the runner:
+Terraform state is stored on the runner:
 
 ```
 /opt/terraform-state/proxmox-ubuntu-vm-factory
 ```
 
-Azure Arc onboarding occurs during provisioning:
+Azure Arc onboarding occurs during VM provisioning:
 
 ```
 arc = true
@@ -332,12 +336,12 @@ If Arc is disabled later, the machine must be disconnected manually or reprovisi
 
 # 🚀 Future Improvements
 
-Possible expansions for the lab:
+Planned expansions for the lab:
 
-• Multi-node Kubernetes cluster  
-• Flux GitOps automation  
-• Azure Policy enforcement  
+• Multi‑node Kubernetes cluster  
 • Azure Monitor integration  
+• Azure Policy enforcement  
+• GitOps infrastructure modules  
 • Automated patching via Update Manager  
 
 ---
