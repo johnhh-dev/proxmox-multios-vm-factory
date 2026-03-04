@@ -1,4 +1,4 @@
-# 🏗 Proxmox Ubuntu VM Factory
+# 🏗 Proxmox MultiOS VM Factory
 
 ### Terraform-driven VM provisioning with Azure Arc integration
 
