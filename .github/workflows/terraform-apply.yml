@@ -1,0 +1,164 @@
+name: terraform-apply
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  apply:
+    runs-on: [self-hosted, gha-runner-01]
+    environment: prod
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+
+      - name: Ensure Terraform state dir exists
+        run: |
+          sudo mkdir -p /opt/terraform-state/proxmox-ubuntu-vm-factory
+          sudo chown -R $(id -u):$(id -g) /opt/terraform-state
+
+      - run: terraform init -reconfigure
+        env:
+          TF_VAR_proxmox_api_token: ${{ secrets.PX_API_TOKEN }}
+          TF_VAR_ssh_public_key: ${{ secrets.SSH_PUBKEY }}
+          TF_VAR_vm_password: ${{ secrets.VM_PASSWORD }}
+          TF_VAR_proxmox_ssh_username: ${{ secrets.PX_SSH_USER }}
+          TF_VAR_proxmox_ssh_password: ${{ secrets.PX_SSH_PASS }}
+          # Azure Arc (optional)
+          TF_VAR_arc_tenant_id: ${{ secrets.TF_VAR_arc_tenant_id || secrets.TF_VAR_ARC_TENANT_ID || vars.TF_VAR_ARC_TENANT_ID }}
+          TF_VAR_arc_subscription_id: ${{ secrets.TF_VAR_arc_subscription_id || secrets.TF_VAR_ARC_SUBSCRIPTION_ID || vars.TF_VAR_ARC_SUBSCRIPTION_ID }}
+          TF_VAR_arc_resource_group: ${{ secrets.TF_VAR_arc_resource_group || secrets.TF_VAR_ARC_RESOURCE_GROUP || vars.TF_VAR_ARC_RESOURCE_GROUP }}
+          TF_VAR_arc_location: ${{ secrets.TF_VAR_arc_location || secrets.TF_VAR_ARC_LOCATION || vars.TF_VAR_ARC_LOCATION }}
+          TF_VAR_arc_cloud: ${{ secrets.TF_VAR_arc_cloud || secrets.TF_VAR_ARC_CLOUD || vars.TF_VAR_ARC_CLOUD }}
+          TF_VAR_arc_sp_id: ${{ secrets.TF_VAR_arc_sp_id || secrets.TF_VAR_ARC_SP_ID || vars.TF_VAR_ARC_SP_ID }}
+          TF_VAR_arc_sp_secret: ${{ secrets.TF_VAR_arc_sp_secret || secrets.TF_VAR_ARC_SP_SECRET }}
+      - name: Show Terraform state (debug)
+        shell: bash
+        run: |
+          set +e
+          terraform state list 2>/dev/null
+          echo "(terraform state list exit code=$?)"
+          exit 0
+
+      - name: Safety check (block apply if state is empty and locals.vms is non-empty)
+        env:
+          TF_BOOTSTRAP: ${{ vars.TF_BOOTSTRAP }}
+        run: |
+          set -euo pipefail
+
+          # If no desired VMs, nothing to protect.
+          if grep -qE 'vms\s*=\s*\{\s*\}' locals.tf; then
+            echo "locals.vms is empty (no desired VMs)."
+            exit 0
+          fi
+
+          # Allow first-time bootstrap when state file does not exist yet.
+          if [ "${TF_BOOTSTRAP:-}" = "true" ]; then
+            echo "TF_BOOTSTRAP=true - skipping empty-state safety check."
+            exit 0
+          fi
+
+          # Count resources in state (handle missing state file gracefully).
+          STATE_COUNT="$( (terraform state list 2>/dev/null || true) | wc -l | tr -d ' ' )"
+
+          if [ "$STATE_COUNT" -eq 0 ]; then
+            echo "::error::Terraform state is empty, but locals.vms is not. This usually means you are running without the correct persisted state, which can create unmanaged (orphan) VMs. Set repo variable TF_BOOTSTRAP=true for first-time bootstrap."
+            exit 1
+          fi
+
+          echo "State looks non-empty ($STATE_COUNT resources). Proceeding."
+      - name: Terraform plan
+        run: terraform plan -out=tfplan
+        env:
+          TF_VAR_proxmox_api_token: ${{ secrets.PX_API_TOKEN }}
+          TF_VAR_ssh_public_key: ${{ secrets.SSH_PUBKEY }}
+          TF_VAR_vm_password: ${{ secrets.VM_PASSWORD }}
+          TF_VAR_proxmox_ssh_username: ${{ secrets.PX_SSH_USER }}
+          TF_VAR_proxmox_ssh_password: ${{ secrets.PX_SSH_PASS }}
+          # Azure Arc (optional)
+          TF_VAR_arc_tenant_id: ${{ secrets.TF_VAR_arc_tenant_id || secrets.TF_VAR_ARC_TENANT_ID || vars.TF_VAR_ARC_TENANT_ID }}
+          TF_VAR_arc_subscription_id: ${{ secrets.TF_VAR_arc_subscription_id || secrets.TF_VAR_ARC_SUBSCRIPTION_ID || vars.TF_VAR_ARC_SUBSCRIPTION_ID }}
+          TF_VAR_arc_resource_group: ${{ secrets.TF_VAR_arc_resource_group || secrets.TF_VAR_ARC_RESOURCE_GROUP || vars.TF_VAR_ARC_RESOURCE_GROUP }}
+          TF_VAR_arc_location: ${{ secrets.TF_VAR_arc_location || secrets.TF_VAR_ARC_LOCATION || vars.TF_VAR_ARC_LOCATION }}
+          TF_VAR_arc_cloud: ${{ secrets.TF_VAR_arc_cloud || secrets.TF_VAR_ARC_CLOUD || vars.TF_VAR_ARC_CLOUD }}
+          TF_VAR_arc_sp_id: ${{ secrets.TF_VAR_arc_sp_id || secrets.TF_VAR_ARC_SP_ID || vars.TF_VAR_ARC_SP_ID }}
+          TF_VAR_arc_sp_secret: ${{ secrets.TF_VAR_arc_sp_secret || secrets.TF_VAR_ARC_SP_SECRET }}
+
+      - name: Arc cleanup (pre-apply) for VMs being destroyed
+        shell: bash
+        env:
+          ARC_TENANT_ID: ${{ secrets.TF_VAR_arc_tenant_id || secrets.TF_VAR_ARC_TENANT_ID || vars.TF_VAR_ARC_TENANT_ID }}
+          ARC_SUBSCRIPTION_ID: ${{ secrets.TF_VAR_arc_subscription_id || secrets.TF_VAR_ARC_SUBSCRIPTION_ID || vars.TF_VAR_ARC_SUBSCRIPTION_ID }}
+          ARC_RESOURCE_GROUP: ${{ secrets.TF_VAR_arc_resource_group || secrets.TF_VAR_ARC_RESOURCE_GROUP || vars.TF_VAR_ARC_RESOURCE_GROUP }}
+          ARC_SP_ID: ${{ secrets.TF_VAR_arc_sp_id || secrets.TF_VAR_ARC_SP_ID || vars.TF_VAR_ARC_SP_ID }}
+          ARC_SP_SECRET: ${{ secrets.TF_VAR_arc_sp_secret || secrets.TF_VAR_ARC_SP_SECRET }}
+        run: |
+          set -euo pipefail
+
+          # Only attempt cleanup if Arc credentials are present
+          if [ -z "${ARC_TENANT_ID:-}" ] || [ -z "${ARC_SUBSCRIPTION_ID:-}" ] || [ -z "${ARC_RESOURCE_GROUP:-}" ] || [ -z "${ARC_SP_ID:-}" ] || [ -z "${ARC_SP_SECRET:-}" ]; then
+            echo "Arc cleanup: skipping (missing Arc secrets)."
+            exit 0
+          fi
+
+          terraform show -json tfplan > tfplan.json
+          python3 .github/scripts/extract_arc_names_from_plan.py tfplan.json > arc_delete_names.txt || true
+
+          if [ ! -s arc_delete_names.txt ]; then
+            echo "Arc cleanup: no VMs scheduled for delete in plan."
+            exit 0
+          fi
+
+          echo "Arc cleanup: will attempt to delete the following Arc machine resources:"
+          cat arc_delete_names.txt
+
+          # Ensure Azure CLI
+          if ! command -v az >/dev/null 2>&1; then
+            echo "Installing Azure CLI..."
+            curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+          fi
+
+          az login --service-principal -u "$ARC_SP_ID" -p "$ARC_SP_SECRET" --tenant "$ARC_TENANT_ID" >/dev/null
+          az account set --subscription "$ARC_SUBSCRIPTION_ID"
+
+          # Ensure required resource provider is registered (Arc uses Microsoft.HybridCompute)
+          RP_STATE="$(az provider show -n Microsoft.HybridCompute --query registrationState -o tsv 2>/dev/null || true)"
+          if [ "$RP_STATE" != "Registered" ]; then
+            echo "Registering resource provider Microsoft.HybridCompute (current state: ${RP_STATE:-unknown})"
+            az provider register -n Microsoft.HybridCompute --wait >/dev/null
+          fi
+
+          while IFS= read -r NAME; do
+            [ -z "$NAME" ] && continue
+            ID="/subscriptions/$ARC_SUBSCRIPTION_ID/resourceGroups/$ARC_RESOURCE_GROUP/providers/Microsoft.HybridCompute/machines/$NAME"
+            echo "Deleting Arc resource: $ID"
+            az resource delete --ids "$ID" || true
+          done < arc_delete_names.txt
+
+      - name: Terraform apply
+        run: terraform apply -auto-approve tfplan
+        env:
+          TF_VAR_proxmox_api_token: ${{ secrets.PX_API_TOKEN }}
+          TF_VAR_ssh_public_key: ${{ secrets.SSH_PUBKEY }}
+          TF_VAR_vm_password: ${{ secrets.VM_PASSWORD }}
+          TF_VAR_proxmox_ssh_username: ${{ secrets.PX_SSH_USER }}
+          TF_VAR_proxmox_ssh_password: ${{ secrets.PX_SSH_PASS }}
+          # Azure Arc (optional)
+          TF_VAR_arc_tenant_id: ${{ secrets.TF_VAR_arc_tenant_id || secrets.TF_VAR_ARC_TENANT_ID || vars.TF_VAR_ARC_TENANT_ID }}
+          TF_VAR_arc_subscription_id: ${{ secrets.TF_VAR_arc_subscription_id || secrets.TF_VAR_ARC_SUBSCRIPTION_ID || vars.TF_VAR_ARC_SUBSCRIPTION_ID }}
+          TF_VAR_arc_resource_group: ${{ secrets.TF_VAR_arc_resource_group || secrets.TF_VAR_ARC_RESOURCE_GROUP || vars.TF_VAR_ARC_RESOURCE_GROUP }}
+          TF_VAR_arc_location: ${{ secrets.TF_VAR_arc_location || secrets.TF_VAR_ARC_LOCATION || vars.TF_VAR_ARC_LOCATION }}
+          TF_VAR_arc_cloud: ${{ secrets.TF_VAR_arc_cloud || secrets.TF_VAR_ARC_CLOUD || vars.TF_VAR_ARC_CLOUD }}
+          TF_VAR_arc_sp_id: ${{ secrets.TF_VAR_arc_sp_id || secrets.TF_VAR_ARC_SP_ID || vars.TF_VAR_ARC_SP_ID }}
+          TF_VAR_arc_sp_secret: ${{ secrets.TF_VAR_arc_sp_secret || secrets.TF_VAR_ARC_SP_SECRET }}
+
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apply-debug-${{ github.run_id }}
+          if-no-files-found: ignore
+          path: |
+            tfplan.json
+            arc_delete_names.txt

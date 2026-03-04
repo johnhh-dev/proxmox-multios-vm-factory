@@ -1,0 +1,74 @@
+#ps1
+# Cloudbase-Init will execute this user-data if configured in the Windows template.
+# This script is intentionally minimal: it can enable WinRM and optionally onboard to Azure Arc.
+
+$ErrorActionPreference = "Stop"
+
+$ArcEnabled = "${arc_enabled}"
+$ArcResourceName = "${arc_resource_name}"
+$ArcTags = "${arc_tags}"
+
+$EnableWinRM = "${windows_enable_winrm}"
+
+if ($EnableWinRM -eq "true") {
+  Write-Host "Enabling WinRM..."
+  winrm quickconfig -q
+  winrm set winrm/config/service/auth '@{Basic="true"}'
+  winrm set winrm/config/service '@{AllowUnencrypted="true"}'
+  Enable-NetFirewallRule -DisplayGroup "Windows Remote Management"
+}
+
+if ($ArcEnabled -ne "true") {
+  Write-Host "Azure Arc: disabled for this VM."
+  exit 0
+}
+
+# Minimal required Arc variables
+$TenantId = "${arc_tenant_id}"
+$SubscriptionId = "${arc_subscription_id}"
+$ResourceGroup = "${arc_resource_group}"
+$Location = "${arc_location}"
+$Cloud = "${arc_cloud}"
+$SpId = "${arc_sp_id}"
+$SpSecret = "${arc_sp_secret}"
+
+if ([string]::IsNullOrWhiteSpace($TenantId) -or [string]::IsNullOrWhiteSpace($SubscriptionId) -or
+    [string]::IsNullOrWhiteSpace($ResourceGroup) -or [string]::IsNullOrWhiteSpace($Location) -or
+    [string]::IsNullOrWhiteSpace($SpId) -or [string]::IsNullOrWhiteSpace($SpSecret)) {
+  Write-Host "Azure Arc enabled but required variables are missing. Skipping."
+  exit 0
+}
+
+$Log = "C:\arc-onboard.log"
+"=== Azure Arc onboarding $(Get-Date -Format o) ===" | Out-File -FilePath $Log -Append -Encoding utf8
+
+# Install agent if missing
+if (-not (Get-Command azcmagent.exe -ErrorAction SilentlyContinue)) {
+  Write-Host "Installing azcmagent..."
+  $scriptUrl = "${arc_install_script_url}"
+  $wc = New-Object System.Net.WebClient
+  $install = $wc.DownloadString($scriptUrl)
+  Invoke-Expression $install
+}
+
+# Build connect args
+$Args = @(
+  "connect",
+  "--service-principal-id", $SpId,
+  "--service-principal-secret", $SpSecret,
+  "--tenant-id", $TenantId,
+  "--subscription-id", $SubscriptionId,
+  "--resource-group", $ResourceGroup,
+  "--location", $Location,
+  "--cloud", $Cloud
+)
+
+if (-not [string]::IsNullOrWhiteSpace($ArcResourceName)) {
+  $Args += @("--resource-name", $ArcResourceName)
+}
+if (-not [string]::IsNullOrWhiteSpace($ArcTags)) {
+  $Args += @("--tags", $ArcTags)
+}
+
+Write-Host "Connecting to Azure Arc..."
+& azcmagent.exe @Args | Tee-Object -FilePath $Log -Append

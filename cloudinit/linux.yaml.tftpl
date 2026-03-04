@@ -1,0 +1,118 @@
+#cloud-config
+hostname: ${hostname}
+fqdn: ${fqdn}
+manage_etc_hosts: true
+
+ssh_pwauth: true
+disable_root: true
+
+chpasswd:
+  expire: false
+  list: |
+    ubuntu:${plain_password}
+
+package_update: true
+packages:
+  - qemu-guest-agent
+  - curl
+  - ca-certificates
+
+write_files:
+  - path: /usr/local/sbin/arc-onboard.sh
+    permissions: "0700"
+    owner: root:root
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      ARC_ENABLED="${arc_enabled}"
+      ARC_RESOURCE_NAME="${arc_resource_name}"
+      ARC_TAGS="${arc_tags}"
+
+      LOG="/var/log/arc-onboard.log"
+      exec >>"$LOG" 2>&1
+      echo "=== Azure Arc onboarding $(date -Is) ==="
+
+      if [ "$ARC_ENABLED" != "true" ]; then
+        echo "Azure Arc: disabled for this VM."
+        exit 0
+      fi
+
+      # Require minimum config values
+      if [ -z "${arc_subscription_id}" ] || [ -z "${arc_tenant_id}" ] || [ -z "${arc_resource_group}" ] || [ -z "${arc_location}" ] || [ -z "${arc_sp_id}" ] || [ -z "${arc_sp_secret}" ]; then
+        echo "Azure Arc: enabled but required TF_VAR_arc_* values are missing. Skipping connect."
+        exit 0
+      fi
+
+      echo "ARC_RESOURCE_NAME=$ARC_RESOURCE_NAME"
+      echo "ARC_RESOURCE_GROUP=${arc_resource_group}"
+      echo "ARC_LOCATION=${arc_location}"
+      echo "ARC_CLOUD=${arc_cloud}"
+
+      # Wait for network + DNS
+      for i in $(seq 1 60); do
+        if ping -c1 -W1 1.1.1.1 >/dev/null 2>&1 && getent hosts management.azure.com >/dev/null 2>&1; then
+          echo "Network OK"
+          break
+        fi
+        echo "Waiting for network/DNS... ($i/60)"
+        sleep 5
+      done
+
+      # Install agent if missing
+      if ! command -v azcmagent >/dev/null 2>&1; then
+        echo "Installing azcmagent..."
+        curl -sSL "${arc_install_script_url}" | bash
+      fi
+
+      # If already connected, exit cleanly
+      if azcmagent show >/dev/null 2>&1; then
+        STATUS="$(azcmagent show 2>/dev/null | awk -F': ' '/Agent Status/ {print $2}' | tr -d '\r')"
+        if [ "$STATUS" = "Connected" ]; then
+          echo "Already connected."
+          exit 0
+        fi
+      fi
+
+      CONNECT_ARGS=(
+        --service-principal-id "${arc_sp_id}"
+        --service-principal-secret "${arc_sp_secret}"
+        --tenant-id "${arc_tenant_id}"
+        --subscription-id "${arc_subscription_id}"
+        --resource-group "${arc_resource_group}"
+        --location "${arc_location}"
+        --cloud "${arc_cloud}"
+      )
+
+      if [ -n "$ARC_RESOURCE_NAME" ]; then
+        CONNECT_ARGS+=( --resource-name "$ARC_RESOURCE_NAME" )
+      fi
+
+      if [ -n "$ARC_TAGS" ]; then
+        CONNECT_ARGS+=( --tags "$ARC_TAGS" )
+      fi
+
+      # Retry connect (Arc can fail briefly right after boot)
+      for attempt in $(seq 1 10); do
+        echo "Connect attempt $attempt/10..."
+        if azcmagent connect "$${CONNECT_ARGS[@]}"; then
+          echo "Connect succeeded."
+          echo "=== Azure Arc onboarding done $(date -Is) ==="
+          exit 0
+        fi
+        echo "Connect failed. Sleeping 30s..."
+        sleep 30
+      done
+
+      echo "Azure Arc: connect failed after retries."
+      exit 1
+
+runcmd:
+  - usermod -U ubuntu || true
+  - sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+  - sed -i 's/^#\?KbdInteractiveAuthentication.*/KbdInteractiveAuthentication yes/' /etc/ssh/sshd_config
+  - systemctl restart ssh
+  - systemctl enable --now qemu-guest-agent
+  - [ bash, -lc, "/usr/local/sbin/arc-onboard.sh" ]
+
+final_message: "cloud-init finished"

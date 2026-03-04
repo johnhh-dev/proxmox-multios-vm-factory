@@ -1,0 +1,55 @@
+name: terraform-plan
+on:
+  pull_request:
+
+jobs:
+  plan:
+    runs-on: [self-hosted, gha-runner-01]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+
+      - name: Ensure Terraform state dir exists
+        run: |
+          sudo mkdir -p /opt/terraform-state/proxmox-ubuntu-vm-factory
+          sudo chown -R $(id -u):$(id -g) /opt/terraform-state
+
+      - run: terraform init -reconfigure
+        env:
+          TF_VAR_proxmox_api_token: ${{ secrets.PX_API_TOKEN }}
+          TF_VAR_ssh_public_key: ${{ secrets.SSH_PUBKEY }}
+          TF_VAR_vm_password: ${{ secrets.VM_PASSWORD }}
+          TF_VAR_proxmox_ssh_username: ${{ secrets.PX_SSH_USER }}
+          TF_VAR_proxmox_ssh_password: ${{ secrets.PX_SSH_PASS }}
+          # Azure Arc (optional)
+          TF_VAR_arc_tenant_id: ${{ secrets.TF_VAR_arc_tenant_id || secrets.TF_VAR_ARC_TENANT_ID || vars.TF_VAR_ARC_TENANT_ID }}
+          TF_VAR_arc_subscription_id: ${{ secrets.TF_VAR_arc_subscription_id || secrets.TF_VAR_ARC_SUBSCRIPTION_ID || vars.TF_VAR_ARC_SUBSCRIPTION_ID }}
+          TF_VAR_arc_resource_group: ${{ secrets.TF_VAR_arc_resource_group || secrets.TF_VAR_ARC_RESOURCE_GROUP || vars.TF_VAR_ARC_RESOURCE_GROUP }}
+          TF_VAR_arc_location: ${{ secrets.TF_VAR_arc_location || secrets.TF_VAR_ARC_LOCATION || vars.TF_VAR_ARC_LOCATION }}
+          TF_VAR_arc_cloud: ${{ secrets.TF_VAR_arc_cloud || secrets.TF_VAR_ARC_CLOUD || vars.TF_VAR_ARC_CLOUD }}
+          TF_VAR_arc_sp_id: ${{ secrets.TF_VAR_arc_sp_id || secrets.TF_VAR_ARC_SP_ID || vars.TF_VAR_ARC_SP_ID }}
+          TF_VAR_arc_sp_secret: ${{ secrets.TF_VAR_arc_sp_secret || secrets.TF_VAR_ARC_SP_SECRET }}
+      - name: Show Terraform state (debug)
+        shell: bash
+        run: |
+          set +e
+          terraform state list 2>/dev/null
+          echo "(terraform state list exit code=$?)"
+          exit 0
+      - run: terraform plan -no-color
+        env:
+          TF_VAR_proxmox_api_token: ${{ secrets.PX_API_TOKEN }}
+          TF_VAR_ssh_public_key: ${{ secrets.SSH_PUBKEY }}
+          TF_VAR_vm_password: ${{ secrets.VM_PASSWORD }}
+          TF_VAR_proxmox_ssh_username: ${{ secrets.PX_SSH_USER }}
+          TF_VAR_proxmox_ssh_password: ${{ secrets.PX_SSH_PASS }}
+          # Azure Arc (optional)
+          TF_VAR_arc_tenant_id: ${{ secrets.TF_VAR_arc_tenant_id || secrets.TF_VAR_ARC_TENANT_ID || vars.TF_VAR_ARC_TENANT_ID }}
+          TF_VAR_arc_subscription_id: ${{ secrets.TF_VAR_arc_subscription_id || secrets.TF_VAR_ARC_SUBSCRIPTION_ID || vars.TF_VAR_ARC_SUBSCRIPTION_ID }}
+          TF_VAR_arc_resource_group: ${{ secrets.TF_VAR_arc_resource_group || secrets.TF_VAR_ARC_RESOURCE_GROUP || vars.TF_VAR_ARC_RESOURCE_GROUP }}
+          TF_VAR_arc_location: ${{ secrets.TF_VAR_arc_location || secrets.TF_VAR_ARC_LOCATION || vars.TF_VAR_ARC_LOCATION }}
+          TF_VAR_arc_cloud: ${{ secrets.TF_VAR_arc_cloud || secrets.TF_VAR_ARC_CLOUD || vars.TF_VAR_ARC_CLOUD }}
+          TF_VAR_arc_sp_id: ${{ secrets.TF_VAR_arc_sp_id || secrets.TF_VAR_ARC_SP_ID || vars.TF_VAR_ARC_SP_ID }}
+          TF_VAR_arc_sp_secret: ${{ secrets.TF_VAR_arc_sp_secret || secrets.TF_VAR_ARC_SP_SECRET }}
