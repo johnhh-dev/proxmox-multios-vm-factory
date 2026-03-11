@@ -28,7 +28,7 @@ variable "template_vmid_linux" {
 variable "template_vmid_windows" {
   type        = number
   description = "Proxmox template VMID for Windows."
-  default     = 9100
+  default     = 9170
 }
 variable "ssh_public_key" {
   type = string
@@ -84,34 +84,26 @@ variable "proxmox_ssh_port" {
 
 
 
-variable "vm_password" {
+variable "linux_vm_password" {
   type        = string
   description = "Plaintext password for the ubuntu user (cloud-init chpasswd). Use only on trusted networks."
   sensitive   = true
+  default     = null
 }
-
-
-
-
 
 # --- Windows (optional; template-dependent) ---
-variable "windows_admin_username" {
-  type        = string
-  description = "Default local admin username for Windows user-data (if your template uses it)."
-  default     = "labadmin"
-}
-
 variable "windows_admin_password" {
   type        = string
-  description = "Default local admin password for Windows user-data (if your template uses it)."
-  default     = ""
+  description = "Dedicated Windows Administrator password for Cloudbase-Init user-data."
+  default     = null
   sensitive   = true
 }
 
+
 variable "windows_enable_winrm_default" {
   type        = bool
-  description = "Enable WinRM in Windows user-data by default (template-dependent)."
-  default     = false
+  description = "Enable WinRM in Windows user-data by default."
+  default     = true
 }
 # --- Azure Arc (optional) ---
 variable "arc_enabled_default" {

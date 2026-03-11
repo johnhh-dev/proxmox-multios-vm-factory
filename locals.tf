@@ -38,11 +38,24 @@ locals {
        memory_mb = 4096
        network = {
          type    = "static"
-         address = "192.168.10.30/24"
+         address = "192.168.10.10/24"
          gateway = "192.168.10.1"
        }
        arc = true
      }*/
+
+    win-srv-01 = {
+        os        = "windows"
+        cores     = 4
+        memory_mb = 8192
+        network = {
+          type = "dhcp"
+        }
+        
+        arc = true
+      }
+
+
 
 
   }
@@ -69,7 +82,7 @@ locals {
 
   # Global defaults
   vm_defaults = {
-    os      = "linux"
+    os      = "windows"
     profile = null
 
     cores     = 2
@@ -83,7 +96,6 @@ locals {
 
     # Windows optional knobs (template-dependent)
     windows = {
-      admin_username = var.windows_admin_username
       admin_password = var.windows_admin_password
       enable_winrm   = var.windows_enable_winrm_default
     }

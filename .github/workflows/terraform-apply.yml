@@ -22,7 +22,8 @@ jobs:
         env:
           TF_VAR_proxmox_api_token: ${{ secrets.PX_API_TOKEN }}
           TF_VAR_ssh_public_key: ${{ secrets.SSH_PUBKEY }}
-          TF_VAR_vm_password: ${{ secrets.VM_PASSWORD }}
+          TF_VAR_linux_vm_password: ${{ secrets.TF_VAR_LINUX_VM_PASSWORD || secrets.TF_VAR_VM_PASSWORD || secrets.VM_PASSWORD }}
+          TF_VAR_windows_admin_password: ${{ secrets.TF_VAR_WINDOWS_ADMIN_PASSWORD  }}
           TF_VAR_proxmox_ssh_username: ${{ secrets.PX_SSH_USER }}
           TF_VAR_proxmox_ssh_password: ${{ secrets.PX_SSH_PASS }}
           # Azure Arc (optional)
@@ -73,7 +74,8 @@ jobs:
         env:
           TF_VAR_proxmox_api_token: ${{ secrets.PX_API_TOKEN }}
           TF_VAR_ssh_public_key: ${{ secrets.SSH_PUBKEY }}
-          TF_VAR_vm_password: ${{ secrets.VM_PASSWORD }}
+          TF_VAR_linux_vm_password: ${{ secrets.TF_VAR_LINUX_VM_PASSWORD || secrets.TF_VAR_VM_PASSWORD || secrets.VM_PASSWORD }}
+          TF_VAR_windows_admin_password: ${{ secrets.TF_VAR_WINDOWS_ADMIN_PASSWORD || secrets.WINDOWS_ADMIN_PASSWORD }}
           TF_VAR_proxmox_ssh_username: ${{ secrets.PX_SSH_USER }}
           TF_VAR_proxmox_ssh_password: ${{ secrets.PX_SSH_PASS }}
           # Azure Arc (optional)
@@ -141,7 +143,8 @@ jobs:
         env:
           TF_VAR_proxmox_api_token: ${{ secrets.PX_API_TOKEN }}
           TF_VAR_ssh_public_key: ${{ secrets.SSH_PUBKEY }}
-          TF_VAR_vm_password: ${{ secrets.VM_PASSWORD }}
+          TF_VAR_linux_vm_password: ${{ secrets.TF_VAR_LINUX_VM_PASSWORD || secrets.TF_VAR_VM_PASSWORD || secrets.VM_PASSWORD }}
+          TF_VAR_windows_admin_password: ${{ secrets.TF_VAR_WINDOWS_ADMIN_PASSWORD || secrets.WINDOWS_ADMIN_PASSWORD }}
           TF_VAR_proxmox_ssh_username: ${{ secrets.PX_SSH_USER }}
           TF_VAR_proxmox_ssh_password: ${{ secrets.PX_SSH_PASS }}
           # Azure Arc (optional)

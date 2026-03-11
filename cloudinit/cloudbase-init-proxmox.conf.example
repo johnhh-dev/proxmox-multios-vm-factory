@@ -1,0 +1,24 @@
+[DEFAULT]
+metadata_services=cloudbaseinit.metadata.services.configdrive.ConfigDriveService
+
+plugins=cloudbaseinit.plugins.common.userdata.UserDataPlugin,cloudbaseinit.plugins.common.networkconfig.NetworkConfigPlugin,cloudbaseinit.plugins.common.sethostname.SetHostNamePlugin
+
+allow_reboot=false
+first_logon_behaviour=no
+stop_service_on_exit=false
+
+mtu_use_dhcp_config=true
+ntp_use_dhcp_config=true
+
+verbose=true
+debug=true
+log_dir=C:\Program Files\Cloudbase Solutions\Cloudbase-Init\log\
+log_file=cloudbase-init.log
+default_log_levels=comtypes=INFO,suds=INFO,iso8601=WARN,requests=WARN
+
+local_scripts_path=C:\Program Files\Cloudbase Solutions\Cloudbase-Init\LocalScripts\
+check_latest_version=false
+
+[config_drive]
+types=iso,vfat
+locations=cdrom,partition

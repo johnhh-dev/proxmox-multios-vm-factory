@@ -1,74 +1,335 @@
-#ps1
-# Cloudbase-Init will execute this user-data if configured in the Windows template.
-# This script is intentionally minimal: it can enable WinRM and optionally onboard to Azure Arc.
-
+#ps1_sysnative
 $ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
 
-$ArcEnabled = "${arc_enabled}"
-$ArcResourceName = "${arc_resource_name}"
-$ArcTags = "${arc_tags}"
+$LogPath = "C:\cloudbase-firstboot-test.log"
+$TranscriptPath = "C:\cloudbase-firstboot-transcript.log"
+$ArcLogPath = "C:\arc-onboard.log"
+$RunOnceMarker = "C:\ProgramData\vm-factory-firstboot.done"
 
-$EnableWinRM = "${windows_enable_winrm}"
-
-if ($EnableWinRM -eq "true") {
-  Write-Host "Enabling WinRM..."
-  winrm quickconfig -q
-  winrm set winrm/config/service/auth '@{Basic="true"}'
-  winrm set winrm/config/service '@{AllowUnencrypted="true"}'
-  Enable-NetFirewallRule -DisplayGroup "Windows Remote Management"
+function Write-Log {
+    param([string]$Message)
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+    "$timestamp $Message" | Out-File -FilePath $LogPath -Append -Encoding utf8
 }
 
-if ($ArcEnabled -ne "true") {
-  Write-Host "Azure Arc: disabled for this VM."
-  exit 0
+function Write-ArcLog {
+    param([string]$Message)
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+    "$timestamp $Message" | Out-File -FilePath $ArcLogPath -Append -Encoding utf8
 }
 
-# Minimal required Arc variables
-$TenantId = "${arc_tenant_id}"
-$SubscriptionId = "${arc_subscription_id}"
-$ResourceGroup = "${arc_resource_group}"
-$Location = "${arc_location}"
-$Cloud = "${arc_cloud}"
-$SpId = "${arc_sp_id}"
-$SpSecret = "${arc_sp_secret}"
 
-if ([string]::IsNullOrWhiteSpace($TenantId) -or [string]::IsNullOrWhiteSpace($SubscriptionId) -or
-    [string]::IsNullOrWhiteSpace($ResourceGroup) -or [string]::IsNullOrWhiteSpace($Location) -or
-    [string]::IsNullOrWhiteSpace($SpId) -or [string]::IsNullOrWhiteSpace($SpSecret)) {
-  Write-Host "Azure Arc enabled but required variables are missing. Skipping."
-  exit 0
+function Set-StaticDnsServers {
+    param(
+        [string[]]$Servers = @("192.168.10.2","192.168.10.1")
+    )
+    try {
+        $upAdapters = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.HardwareInterface -eq $true }
+        foreach ($adapter in $upAdapters) {
+            try {
+                Set-DnsClientServerAddress -InterfaceIndex $adapter.InterfaceIndex -ServerAddresses $Servers -ErrorAction Stop
+                Write-Log ("DNS servers set on {0}: {1}" -f $adapter.Name, ($Servers -join ", "))
+            } catch {
+                Write-Log ("Failed to set DNS on {0}: {1}" -f $adapter.Name, $_.Exception.Message)
+            }
+        }
+    } catch {
+        Write-Log ("Set-StaticDnsServers failed: " + $_.Exception.Message)
+    }
 }
 
-$Log = "C:\arc-onboard.log"
-"=== Azure Arc onboarding $(Get-Date -Format o) ===" | Out-File -FilePath $Log -Append -Encoding utf8
+function Set-HostnameImmediateBestEffort {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$NewName
+    )
 
-# Install agent if missing
-if (-not (Get-Command azcmagent.exe -ErrorAction SilentlyContinue)) {
-  Write-Host "Installing azcmagent..."
-  $scriptUrl = "${arc_install_script_url}"
-  $wc = New-Object System.Net.WebClient
-  $install = $wc.DownloadString($scriptUrl)
-  Invoke-Expression $install
+    $rebootRequired = $false
+    try {
+        if ($env:COMPUTERNAME -ne "${hostname}") {
+            Rename-Computer -NewName "${hostname}" -Force -ErrorAction Stop
+            $rebootRequired = $true
+            Write-Log "Rename-Computer invoked"
+        }
+
+        $registryPaths = @(
+            'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName',
+            'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ActiveComputerName'
+        )
+        foreach ($path in $registryPaths) {
+            try {
+                Set-ItemProperty -Path $path -Name ComputerName -Value $NewName -Force
+            } catch {
+                Write-Log ("Failed registry hostname update in {0}: {1}" -f $path, $_.Exception.Message)
+            }
+        }
+
+        try {
+            Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' -Name Hostname -Value $NewName -Force
+            Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' -Name "NV Hostname" -Value $NewName -Force
+            Write-Log ("TCP/IP hostname registry updated to: {0}" -f $NewName)
+        } catch {
+            Write-Log ("Failed TCP/IP hostname update: " + $_.Exception.Message)
+        }
+
+        try {
+            $cs = Get-WmiObject -Class Win32_ComputerSystem
+            if ($cs.Rename($NewName).ReturnValue -eq 0) {
+                Write-Log ("WMI rename accepted for: {0}" -f $NewName)
+                $rebootRequired = $true
+            }
+        } catch {
+            Write-Log ("WMI rename attempt failed: " + $_.Exception.Message)
+        }
+
+        $script:env:COMPUTERNAME = $NewName
+        [Environment]::SetEnvironmentVariable('COMPUTERNAME', $NewName, 'Machine')
+
+        try {
+            ipconfig /registerdns | Out-Null
+            ipconfig /release | Out-Null
+            Start-Sleep -Seconds 2
+            ipconfig /renew | Out-Null
+            Write-Log ("DHCP lease renewed after hostname change: {0}" -f $NewName)
+        } catch {
+            Write-Log ("DHCP renew after hostname change failed: " + $_.Exception.Message)
+        }
+
+        if ($rebootRequired) {
+            Write-ArcLog "Hostname change requested; full Windows rename still requires reboot"
+        }
+    } catch {
+        Write-Log ("Set-HostnameImmediateBestEffort failed: " + $_.Exception.Message)
+        throw
+    }
 }
 
-# Build connect args
-$Args = @(
-  "connect",
-  "--service-principal-id", $SpId,
-  "--service-principal-secret", $SpSecret,
-  "--tenant-id", $TenantId,
-  "--subscription-id", $SubscriptionId,
-  "--resource-group", $ResourceGroup,
-  "--location", $Location,
-  "--cloud", $Cloud
-)
+function Wait-ForNetworkReady {
+    param(
+        [string[]]$DnsServers = @("192.168.10.2","192.168.10.1"),
+        [string]$TestHost = "aka.ms",
+        [int]$MaxAttempts = 30,
+        [int]$SleepSeconds = 10
+    )
 
-if (-not [string]::IsNullOrWhiteSpace($ArcResourceName)) {
-  $Args += @("--resource-name", $ArcResourceName)
-}
-if (-not [string]::IsNullOrWhiteSpace($ArcTags)) {
-  $Args += @("--tags", $ArcTags)
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            $hasGateway = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Where-Object { $_.NextHop -and $_.NextHop -ne '0.0.0.0' } | Select-Object -First 1
+            $dnsOk = $false
+            foreach ($dns in $DnsServers) {
+                try {
+                    Resolve-DnsName -Name $TestHost -Server $dns -ErrorAction Stop | Out-Null
+                    $dnsOk = $true
+                    break
+                } catch {}
+            }
+
+            $tcpOk = $false
+            try {
+                $tcpOk = Test-NetConnection -ComputerName $TestHost -Port 443 -InformationLevel Quiet -WarningAction SilentlyContinue
+            } catch {}
+
+            Write-Log ("Network wait attempt {0}/{1}: gateway={2}, dns={3}, tcp443={4}" -f $attempt, $MaxAttempts, [bool]$hasGateway, $dnsOk, $tcpOk)
+
+            if ($hasGateway -and $dnsOk -and $tcpOk) {
+                Write-Log "Network is ready for Azure Arc"
+                return $true
+            }
+        } catch {
+            Write-Log ("Network readiness check error: " + $_.Exception.Message)
+        }
+        Start-Sleep -Seconds $SleepSeconds
+    }
+
+    return $false
 }
 
-Write-Host "Connecting to Azure Arc..."
-& azcmagent.exe @Args | Tee-Object -FilePath $Log -Append
+try {
+    Start-Transcript -Path $TranscriptPath -Append | Out-Null
+} catch {}
+
+if (Test-Path $RunOnceMarker) {
+    Write-Log "Run-once marker exists, exiting without changes"
+    try { Stop-Transcript | Out-Null } catch {}
+    exit 0
+}
+
+Write-Log "Starting Cloudbase first-boot script"
+Write-Log "Template hostname: ${hostname}"
+Write-ArcLog "=== Azure Arc onboarding start ==="
+Write-ArcLog "arc_enabled=${arc_enabled}"
+Write-ArcLog "arc_resource_name=${arc_resource_name}"
+Write-ArcLog "arc_resource_group=${arc_resource_group}"
+Write-ArcLog "arc_location=${arc_location}"
+Write-ArcLog "arc_cloud=${arc_cloud}"
+
+$passwordPlain = @"
+${windows_admin_password}
+"@
+$passwordPlain = $passwordPlain.Trim("`r","`n")
+
+if ([string]::IsNullOrWhiteSpace($passwordPlain)) {
+    throw "windows_admin_password is empty. Set GitHub secret TF_VAR_WINDOWS_ADMIN_PASSWORD or WINDOWS_ADMIN_PASSWORD."
+}
+
+Write-Log ("Password length from template: {0}" -f $passwordPlain.Length)
+
+# Enable built-in Administrator and set password
+cmd /c "net user Administrator /active:yes" | Out-Null
+
+$securePassword = ConvertTo-SecureString $passwordPlain -AsPlainText -Force
+try {
+    $proc = Start-Process -FilePath "cmd.exe" `
+        -ArgumentList @('/c','net','user','Administrator', $passwordPlain) `
+        -Wait -PassThru -NoNewWindow
+    if ($proc.ExitCode -ne 0) {
+        throw "net user failed with exit code $($proc.ExitCode)"
+    }
+    Write-Log "Administrator password applied"
+} catch {
+    Write-Log "Administrator password failed: $($_.Exception.Message)"
+    throw
+}
+
+# Set DNS early so Arc download has working name resolution
+Set-StaticDnsServers -Servers @("192.168.10.2","192.168.10.1")
+
+# Rename host with best-effort immediate DHCP/DNS visibility before reboot
+Set-HostnameImmediateBestEffort -NewName "${hostname}"
+
+# Configure one-time autologon for first boot after restart
+reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v AutoAdminLogon /t REG_SZ /d 1 /f | Out-Null
+reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v DefaultUserName /t REG_SZ /d Administrator /f | Out-Null
+reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v DefaultPassword /t REG_SZ /d "$passwordPlain" /f | Out-Null
+reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v AutoLogonCount /t REG_DWORD /d 1 /f | Out-Null
+reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v Shell /t REG_SZ /d explorer.exe /f | Out-Null
+Write-Log "One-time autologon configured"
+
+# Enable RDP
+reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections /t REG_DWORD /d 0 /f | Out-Null
+try {
+    Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
+} catch {
+    netsh advfirewall firewall set rule group="remote desktop" new enable=Yes | Out-Null
+}
+Write-Log "RDP enabled"
+
+# Azure Arc
+if ("${arc_enabled}" -ne "true") {
+    Write-ArcLog "Azure Arc: disabled for this VM"
+} else {
+    $required = @{
+        arc_subscription_id = "${arc_subscription_id}"
+        arc_tenant_id       = "${arc_tenant_id}"
+        arc_resource_group  = "${arc_resource_group}"
+        arc_location        = "${arc_location}"
+        arc_sp_id           = "${arc_sp_id}"
+        arc_sp_secret       = "${arc_sp_secret}"
+    }
+
+    $missing = @($required.GetEnumerator() | Where-Object { [string]::IsNullOrWhiteSpace($_.Value) } | ForEach-Object { $_.Key })
+    if ($missing.Count -gt 0) {
+        Write-ArcLog ("Azure Arc: required values missing, skipping connect: " + ($missing -join ", "))
+    } else {
+        try {
+            $azcmExe = Join-Path $${env:ProgramFiles} 'AzureConnectedMachineAgent\azcmagent.exe'
+            if (-not (Wait-ForNetworkReady -DnsServers @("192.168.10.2","192.168.10.1") -TestHost "aka.ms" -MaxAttempts 30 -SleepSeconds 10)) {
+                throw "Network not ready for Azure Arc after waiting; DNS servers expected: 192.168.10.2, 192.168.10.1"
+            }
+
+            if (-not (Test-Path $azcmExe)) {
+                Write-ArcLog "azcmagent missing, installing agent"
+                $msiPath = Join-Path $env:TEMP 'AzureConnectedMachineAgent.msi'
+                Invoke-WebRequest -UseBasicParsing -Uri "https://aka.ms/AzureConnectedMachineAgent" -OutFile $msiPath
+                $install = Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i', $msiPath, '/qn', '/norestart') -Wait -PassThru -NoNewWindow
+                if ($install.ExitCode -ne 0) {
+                    throw "Azure Connected Machine Agent install failed with exit code $($install.ExitCode)"
+                }
+                Start-Sleep -Seconds 5
+            } else {
+                Write-ArcLog "azcmagent already installed"
+            }
+
+            if (-not (Test-Path $azcmExe)) {
+                throw "azcmagent.exe not found after install"
+            }
+
+            $showOutput = & $azcmExe show 2>&1
+            $showText = ($showOutput | Out-String)
+            $status = (($showOutput | Select-String -Pattern 'Agent Status\s*:\s*(.+)' | Select-Object -First 1).Matches.Groups[1].Value).Trim()
+            if ($status) {
+                Write-ArcLog "Current azcmagent status: $status"
+            } else {
+                Write-ArcLog "azcmagent show output available but Agent Status not parsed"
+            }
+
+            if ($showText -match '(?im)^\s*Status\s*:\s*Connected\s*$' -or $showText -match '(?im)^\s*Agent Status\s*:\s*Connected\s*$') {
+                Write-ArcLog "Azure Arc: machine already connected, skipping connect"
+            } else {
+                $connectArgs = @(
+                    'connect',
+                    '--service-principal-id', '${arc_sp_id}',
+                    '--service-principal-secret', '${arc_sp_secret}',
+                    '--tenant-id', '${arc_tenant_id}',
+                    '--subscription-id', '${arc_subscription_id}',
+                    '--resource-group', '${arc_resource_group}',
+                    '--location', '${arc_location}',
+                    '--cloud', '${arc_cloud}'
+                )
+
+                if (-not [string]::IsNullOrWhiteSpace('${arc_resource_name}')) {
+                    $connectArgs += @('--resource-name', '${arc_resource_name}')
+                }
+                if (-not [string]::IsNullOrWhiteSpace('${arc_tags}')) {
+                    $connectArgs += @('--tags', '${arc_tags}')
+                }
+
+                Write-ArcLog "Running azcmagent connect"
+                $connectOutput = & $azcmExe @connectArgs 2>&1
+                $connectExit = $LASTEXITCODE
+                ($connectOutput | Out-String).Trim() | Out-File -FilePath $ArcLogPath -Append -Encoding utf8
+                if ($connectExit -ne 0) {
+                    throw "azcmagent connect failed with exit code $connectExit"
+                }
+                Write-ArcLog "Azure Arc: connect succeeded"
+            }
+        } catch {
+            Write-ArcLog ("Azure Arc onboarding failed: " + $_.Exception.Message)
+            throw
+        }
+    }
+}
+
+# Enable WinRM without blocking the rest of first boot
+%{ if windows_enable_winrm ~}
+try {
+    winrm quickconfig -q | Out-Null
+    Set-Service -Name WinRM -StartupType Automatic
+    Start-Service -Name WinRM -ErrorAction SilentlyContinue
+    Enable-PSRemoting -Force -SkipNetworkProfileCheck -ErrorAction Stop | Out-Null
+    winrm set winrm/config/service/auth '@{Basic="true"}' | Out-Null
+    winrm set winrm/config/service '@{AllowUnencrypted="true"}' | Out-Null
+    try {
+        Enable-NetFirewallRule -DisplayGroup "Windows Remote Management" | Out-Null
+    } catch {
+        netsh advfirewall firewall set rule group="windows remote management" new enable=Yes | Out-Null
+    }
+    Write-Log "WinRM enabled"
+} catch {
+    Write-Log ("WinRM configuration failed: " + $_.Exception.Message)
+}
+%{ endif ~}
+
+try {
+    New-Item -ItemType File -Path $RunOnceMarker -Force | Out-Null
+    Write-Log ("Run-once marker written: " + $RunOnceMarker)
+} catch {
+    Write-Log ("Failed to write run-once marker: " + $_.Exception.Message)
+}
+
+Write-ArcLog "=== Azure Arc onboarding end ==="
+Write-Log "Cloudbase first-boot script complete"
+Stop-Transcript | Out-Null
+
+exit 0

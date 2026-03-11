@@ -10,15 +10,14 @@ resource "proxmox_virtual_environment_file" "user_data" {
     data = templatefile(each.value.user_data_tpl, {
       hostname       = each.value.name
       fqdn           = "${each.value.name}.${var.search_domain}"
-      plain_password = var.vm_password
+      plain_password = coalesce(var.linux_vm_password, "")
 
       # Windows (template-dependent; optional)
-      windows_admin_username = each.value.windows.admin_username
-      windows_admin_password = each.value.windows.admin_password
-      windows_enable_winrm   = tostring(each.value.windows.enable_winrm)
+      windows_admin_password = coalesce(var.windows_admin_password, "")
+      windows_enable_winrm   = each.value.windows.enable_winrm
 
       # Azure Arc (optional; enabled per-VM via locals.tf)
-      arc_enabled            = tostring(each.value.arc.enabled)
+      arc_enabled            = each.value.arc.enabled
       arc_resource_name      = each.value.arc.resource_name
       arc_tags               = each.value.arc.tags_string
       arc_cloud              = var.arc_cloud
