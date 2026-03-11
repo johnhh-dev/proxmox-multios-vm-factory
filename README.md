@@ -1,5 +1,10 @@
 # 🏗 Hybrid Azure Arc + Proxmox + Kubernetes Lab
 
+![Terraform](https://img.shields.io/badge/IaC-Terraform-623CE4?logo=terraform)
+![Proxmox](https://img.shields.io/badge/Hypervisor-Proxmox-orange)
+![Azure Arc](https://img.shields.io/badge/Azure-Arc-blue)
+![CI/CD](https://img.shields.io/badge/CI/CD-GitHub%20Actions-black)
+
 A **hybrid cloud lab environment** built to practice **Azure Arc, Kubernetes, Terraform, and DevOps automation** using a local **Proxmox infrastructure** integrated with **Microsoft Azure**.
 
 This lab simulates a **real-world hybrid architecture** where on-premises virtual machines and Kubernetes clusters are managed from Azure using **Azure Arc**.
