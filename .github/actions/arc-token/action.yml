@@ -1,0 +1,40 @@
+name: Arc onboarding token
+description: >-
+  Mint a short-lived Entra access token for Arc onboarding and export it as
+  TF_VAR_arc_access_token for the rest of the job (SEC-001a).
+
+# Why this is a separate action rather than a step inside terraform-env: that
+# action maps secrets onto variables and nothing else, and its mapping is unit
+# tested as a pure function. This one makes a network call and produces a value
+# that is not a secret anybody stored - it is minted per run. Folding the two
+# together would put an HTTP request inside the thing whose whole value is that
+# it is total and side-effect free.
+#
+# Why every workflow that renders the template calls it, not just apply:
+# `templatefile` runs during plan as well, so a token present at apply and
+# absent at plan would make the reviewed plan render different user-data than
+# the apply of the same commit. That is BUG-003 exactly, and it is worth not
+# reintroducing through a different door.
+#
+# The cost of that choice, stated plainly: the token differs between runs, so
+# the snippet resource shows a diff on every plan. It is a redacted diff
+# (SEC-003) on a resource whose content change produces no VM diff at all today
+# (BUG-012, #53). Accepted here as the lesser of the two, and worth revisiting
+# when BUG-012 lands.
+
+inputs:
+  secrets:
+    # Same shape and the same reason as terraform-env: the mapping from secret
+    # name to meaning lives in one Python module, not in an input list per
+    # caller that drifts from it.
+    description: 'The job secrets, JSON-encoded. See the callers in .github/workflows.'
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Mint the Arc onboarding token
+      shell: bash
+      env:
+        GITHUB_SECRETS_JSON: ${{ inputs.secrets }}
+      run: python3 "$GITHUB_ACTION_PATH/../../scripts/mint_arc_token.py" "$GITHUB_ENV"

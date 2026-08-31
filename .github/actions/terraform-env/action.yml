@@ -1,0 +1,55 @@
+name: Terraform environment
+description: >-
+  Populate the canonical TF_VAR_* set for the rest of the job, and fail before
+  Terraform runs if a required secret is missing (BUG-003).
+
+# Why an action rather than an `env:` block per step: the three Terraform
+# workflows each carried their own copy of the same fourteen-line block, on
+# every step that needed it. BUG-003 is what that costs - one copy set
+# `TF_VAR_windows_admin_password` on `terraform init`, where it has no effect,
+# and omitted it from `terraform plan`, so the plan reviewed on a pull request
+# rendered different user-data than the apply of the same commit.
+#
+# Why `toJSON(secrets)` rather than an input per secret: an input list is the
+# same block again, one level down, and would drift the same way. The mapping
+# from secret name to variable name lives in render_terraform_env.py and is unit
+# tested; this file only carries it across the boundary.
+#
+# Trade-off, deliberately taken: `$GITHUB_ENV` is job-scoped, so every step after
+# this one sees the variables, where before each step named its own. Call the
+# action after `checkout` and `setup-terraform` - as all three workflows do - and
+# no third-party action runs with them in scope. In exchange, no step can be
+# added later that runs Terraform without them, which is the failure this
+# addresses.
+
+inputs:
+  secrets:
+    # No expression in this description, deliberately. Actions evaluates
+    # template expressions inside an action manifest's own fields, and the
+    # `secrets` context does not exist there - so writing the caller's syntax
+    # here as documentation fails the action at load time with "Unrecognized
+    # named-value: 'secrets'". The caller passes: secrets: toJSON(secrets),
+    # wrapped in the usual expression braces.
+    description: 'The job secrets, JSON-encoded. See the callers in .github/workflows.'
+    required: true
+  vars:
+    # KAN-012. The repository variables, same shape and the same reason as
+    # secrets: the allowlist of which ones Terraform may see lives in
+    # render_terraform_env.py and is unit tested, not in an input list per
+    # caller.
+    #
+    # Optional, because a repository with no variables set is an ordinary
+    # repository. The caller passes: vars: toJSON(vars), in the usual braces.
+    description: 'The repository variables, JSON-encoded. Optional.'
+    required: false
+    default: '{}'
+
+runs:
+  using: composite
+  steps:
+    - name: Populate TF_VAR_* for this job
+      shell: bash
+      env:
+        GITHUB_SECRETS_JSON: ${{ inputs.secrets }}
+        GITHUB_VARS_JSON: ${{ inputs.vars }}
+      run: python3 "$GITHUB_ACTION_PATH/../../scripts/render_terraform_env.py" "$GITHUB_ENV"

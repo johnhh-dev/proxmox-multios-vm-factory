@@ -1,0 +1,273 @@
+#cloud-config
+#
+# CHORE-004-A4. This template is Ubuntu-specific, and deliberately so - it is
+# rendered for every VM with `os = "linux"`, and the factory clones those from
+# var.template_vmid_linux, an Ubuntu cloud image. The assumptions are written
+# down here rather than left to be discovered on the first non-Ubuntu guest:
+#
+#   - The login account is `ubuntu`. It is hardcoded here and again in main.tf
+#     (initialization.user_account.username). A Debian cloud image calls it
+#     `debian`, RHEL-family images `cloud-user` or `ec2-user`.
+#   - The SSH service unit is `ssh`. On RHEL-family distributions it is `sshd`,
+#     so the `systemctl restart ssh` in runcmd below fails there. Measured on
+#     VM 101: Ubuntu ships `sshd.service` as an *alias* of `ssh.service`, so
+#     both names work here. That means this line succeeding is not evidence the
+#     image is Debian-family - it succeeds either way. ADR 0003 section 2.
+#   - `ssh_pwauth` is honoured through /etc/ssh/sshd_config.d/50-cloud-init.conf,
+#     which assumes an sshd built with that Include - true on Ubuntu, not
+#     universal.
+#   - The package names in `packages` are Debian-family.
+#
+# Supporting a second distribution means selecting these per image rather than
+# editing them in place; none of it is a defect today, because there is one
+# Linux image.
+hostname: ${hostname}
+fqdn: ${fqdn}
+manage_etc_hosts: true
+
+# SEC-007. This is the control that actually decides password SSH on an Ubuntu
+# cloud image: cloud-init writes PasswordAuthentication into
+# /etc/ssh/sshd_config.d/50-cloud-init.conf from this value, and that Include is
+# read before the main file, so it wins over anything runcmd does below. The
+# seds are kept in agreement with it rather than relied upon.
+ssh_pwauth: ${linux_password_auth}
+disable_root: true
+
+# SEC-001b. The chpasswd block that used to live here rendered the password into
+# this file in cleartext, and this file is a snippet that stays on the node for
+# the life of the VM. The password now arrives through the provider's
+# initialization.user_account.password - see main.tf - which Proxmox puts in the
+# user-data it generates, a separate document from this one. `usermod -U ubuntu`
+# in runcmd still unlocks the account.
+
+package_update: true
+packages:
+  - qemu-guest-agent
+  - curl
+  - ca-certificates
+
+write_files:
+  - path: /usr/local/sbin/arc-onboard.sh
+    permissions: "0700"
+    owner: root:root
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      # BUG-010. Every free-form value below crosses the template boundary
+      # base64-encoded, and is decoded here rather than being interpolated into
+      # a quoted shell string.
+      #
+      # The problem being solved: `templatefile` substitutes before bash ever
+      # sees the script, so `TAGS="${"$"}{arc_tags}"` puts the *characters* of the
+      # value inside double quotes - and bash then expands what it finds there.
+      # A tag of `role=$(id -un)` runs `id -un` as root during first boot.
+      # Measured, not theorised. locals.tf rejects a newline and a double quote
+      # in arc.tags, which is what made the site look safe, but `${"$"}` and a
+      # backtick pass that rule and are the two characters that matter here.
+      #
+      # base64 rather than escaping or a quoted heredoc, per BUG-010-A3's
+      # preference for removing the interpolation over armouring it: the base64
+      # alphabet is `A-Za-z0-9+/=`, so an encoded value cannot contain a quote,
+      # a dollar, a backtick or a newline whatever the operator typed. That
+      # turns "is this value shell-safe?" into "is base64 shell-safe?", which is
+      # a much smaller thing to be sure of.
+      #
+      # The cost is that these values are no longer readable in the snippet on
+      # the node. The script echoes the ones worth seeing to its own log below.
+      b64() { printf %s "$1" | base64 -d; }
+
+      # Not encoded, deliberately. `arc_enabled` is a bool rendered by Terraform
+      # and `arc_resource_name` is validated at plan time against
+      # ^[A-Za-z0-9][A-Za-z0-9._-]*$ (BUG-020-A4), so neither can carry a shell
+      # metacharacter. Encoding them would add noise without removing a risk.
+      ARC_ENABLED="${arc_enabled}"
+      ARC_RESOURCE_NAME="${arc_resource_name}"
+
+      ARC_TAGS="$(b64 '${base64encode(arc_tags)}')"
+      ARC_SUBSCRIPTION_ID="$(b64 '${base64encode(arc_subscription_id)}')"
+      ARC_TENANT_ID="$(b64 '${base64encode(arc_tenant_id)}')"
+      ARC_RESOURCE_GROUP="$(b64 '${base64encode(arc_resource_group)}')"
+      ARC_LOCATION="$(b64 '${base64encode(arc_location)}')"
+      ARC_CLOUD="$(b64 '${base64encode(arc_cloud)}')"
+      ARC_INSTALL_SCRIPT_URL="$(b64 '${base64encode(arc_install_script_url)}')"
+
+      LOG="/var/log/arc-onboard.log"
+      exec >>"$LOG" 2>&1
+      echo "=== Azure Arc onboarding $(date -Is) ==="
+
+      # SEC-001d-A1. ADR 0001 path 7: this file is written 0700 with the Arc
+      # onboarding token base64-inlined and is never removed, so it sits in
+      # /usr/local/sbin for the life of the VM. "A search for rm -f, shred,
+      # Remove-Item or Clear- across both templates returns nothing. Neither
+      # guest cleans up after itself." This is the Linux half of stopping that
+      # being true.
+      #
+      # Removing it costs the operator nothing, which is the part worth
+      # checking before agreeing to it. The obvious objection is that a failed
+      # onboarding can no longer be re-run by hand - but the token embedded
+      # here is minted per apply and expires in about an hour (SEC-001a), so a
+      # preserved script is not a retry path, it is a file that cannot work.
+      # What an operator actually needs after a failure is $LOG, which survives
+      # and carries no credential: the echoes below are the resource name,
+      # resource group, location and cloud, and never the token.
+      #
+      # One cleanup function and one trap, not two. `trap ... EXIT` *replaces*
+      # any previous EXIT handler rather than adding to it, so registering a
+      # second one further down - as the connect-config cleanup used to do -
+      # would silently disable whichever was set first. CONNECT_DIR is declared
+      # empty here so the handler can be installed before there is anything for
+      # it to remove.
+      #
+      # Unlinking a script bash is currently executing is safe: bash holds the
+      # file open, and the inode survives until that descriptor closes.
+      SELF="/usr/local/sbin/arc-onboard.sh"
+      CONNECT_DIR=""
+
+      cleanup() {
+        if [ -n "$CONNECT_DIR" ]; then
+          rm -rf "$CONNECT_DIR"
+        fi
+        rm -f "$SELF"
+      }
+      trap cleanup EXIT INT TERM
+
+      if [ "$ARC_ENABLED" != "true" ]; then
+        echo "Azure Arc: disabled for this VM."
+        exit 0
+      fi
+
+      # Require minimum config values
+      if [ -z "$ARC_SUBSCRIPTION_ID" ] || [ -z "$ARC_TENANT_ID" ] || [ -z "$ARC_RESOURCE_GROUP" ] || [ -z "$ARC_LOCATION" ]; then
+        echo "Azure Arc: enabled but required TF_VAR_arc_* values are missing. Skipping connect."
+        exit 0
+      fi
+
+      # SEC-001a. The token is minted per run by .github/actions/arc-token, so
+      # an empty one here means the run had no service principal to mint with -
+      # a different fault from a missing subscription id, and worth its own line
+      # rather than being folded into the check above.
+      ARC_ACCESS_TOKEN="$(b64 '${base64encode(arc_access_token)}')"
+      if [ -z "$ARC_ACCESS_TOKEN" ]; then
+        echo "Azure Arc: no onboarding token was minted for this run. Skipping connect."
+        exit 0
+      fi
+
+      echo "ARC_RESOURCE_NAME=$ARC_RESOURCE_NAME"
+      echo "ARC_RESOURCE_GROUP=$ARC_RESOURCE_GROUP"
+      echo "ARC_LOCATION=$ARC_LOCATION"
+      echo "ARC_CLOUD=$ARC_CLOUD"
+
+      # KAN-012-A1/A3. This was `ping -c1 -W1 1.1.1.1 && getent hosts
+      # management.azure.com`, and both halves were wrong in a way that only
+      # showed up as a slow boot.
+      #
+      # 1.1.1.1 was the last environment-specific address embedded in a guest
+      # script, which KAN-012's acceptance criterion forbids outright. It is
+      # also the wrong test twice over: a lab that filters egress ICMP fails it
+      # while the network is fine, and a lab with no route to 1.1.1.1 waits the
+      # full five minutes and then carries on regardless, because this loop
+      # falls through rather than failing.
+      #
+      # The ping is gone rather than re-pointed. Resolving a name is strictly
+      # stronger - it proves L3 to the resolver *and* that DNS answers - and it
+      # cannot be defeated by ICMP filtering. What the ping was really standing
+      # in for is "is there a route off this network at all", and that is a
+      # local question with a local answer, which is what `ip route show
+      # default` is. The Windows template has always done exactly this pair:
+      # Get-NetRoute for a default route, then a name lookup.
+      #
+      # NETWORK_PROBE_HOST is one variable reaching both guests, so the two
+      # cannot drift the way the resolvers did before BUG-018.
+      NETWORK_PROBE_HOST="$(b64 '${base64encode(network_probe_host)}')"
+
+      for i in $(seq 1 60); do
+        if ip route show default | grep -q . && getent hosts "$NETWORK_PROBE_HOST" >/dev/null 2>&1; then
+          echo "Network OK (default route present, $NETWORK_PROBE_HOST resolves)"
+          break
+        fi
+        echo "Waiting for network/DNS... ($i/60)"
+        sleep 5
+      done
+
+      # Install agent if missing
+      if ! command -v azcmagent >/dev/null 2>&1; then
+        echo "Installing azcmagent..."
+        curl -sSL "$ARC_INSTALL_SCRIPT_URL" | bash
+      fi
+
+      # If already connected, exit cleanly
+      if azcmagent show >/dev/null 2>&1; then
+        STATUS="$(azcmagent show 2>/dev/null | awk -F': ' '/Agent Status/ {print $2}' | tr -d '\r')"
+        if [ "$STATUS" = "Connected" ]; then
+          echo "Already connected."
+          exit 0
+        fi
+      fi
+
+      # SEC-001a. `azcmagent --config` takes a JSON file whose keys are the
+      # long flag names, so the token never appears in the process arguments
+      # where /proc/<pid>/cmdline would expose it to every account on the box.
+      #
+      # Only the token goes in the file. Tags and the resource name are not
+      # credentials, and keeping them as arguments avoids having to JSON-escape
+      # operator-supplied strings in a shell heredoc - which is BUG-010's
+      # failure mode, reached from a new direction. A JWT is base64url and dots,
+      # so it carries nothing that needs escaping.
+      CONNECT_DIR="$(mktemp -d)"
+      chmod 700 "$CONNECT_DIR"
+      CONNECT_CONFIG="$CONNECT_DIR/connect.json"
+      # SEC-001d-A1. The trap that used to be here is now the single cleanup()
+      # registered at the top of the script - see the note there. Assigning
+      # CONNECT_DIR is all that is needed to arm it, because the handler tests
+      # the variable rather than being installed alongside it.
+      ( umask 077; printf '{"access-token":"%s"}\n' "$ARC_ACCESS_TOKEN" > "$CONNECT_CONFIG" )
+
+      CONNECT_ARGS=(
+        --config "$CONNECT_CONFIG"
+        --tenant-id "$ARC_TENANT_ID"
+        --subscription-id "$ARC_SUBSCRIPTION_ID"
+        --resource-group "$ARC_RESOURCE_GROUP"
+        --location "$ARC_LOCATION"
+        --cloud "$ARC_CLOUD"
+      )
+
+      if [ -n "$ARC_RESOURCE_NAME" ]; then
+        CONNECT_ARGS+=( --resource-name "$ARC_RESOURCE_NAME" )
+      fi
+
+      if [ -n "$ARC_TAGS" ]; then
+        CONNECT_ARGS+=( --tags "$ARC_TAGS" )
+      fi
+
+      # Retry connect (Arc can fail briefly right after boot)
+      for attempt in $(seq 1 10); do
+        echo "Connect attempt $attempt/10..."
+        if azcmagent connect "$${CONNECT_ARGS[@]}"; then
+          echo "Connect succeeded."
+          echo "=== Azure Arc onboarding done $(date -Is) ==="
+          exit 0
+        fi
+        echo "Connect failed. Sleeping 30s..."
+        sleep 30
+      done
+
+      echo "Azure Arc: connect failed after retries."
+      exit 1
+
+runcmd:
+  - usermod -U ubuntu || true
+%{ if linux_password_auth ~}
+  - sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+  - sed -i 's/^#\?KbdInteractiveAuthentication.*/KbdInteractiveAuthentication yes/' /etc/ssh/sshd_config
+%{ else ~}
+  - sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+  - sed -i 's/^#\?KbdInteractiveAuthentication.*/KbdInteractiveAuthentication no/' /etc/ssh/sshd_config
+%{ endif ~}
+  # CHORE-004-A4. `ssh` is the Debian/Ubuntu unit name; RHEL-family calls it
+  # `sshd`. See the note at the top of this file.
+  - systemctl restart ssh
+  - systemctl enable --now qemu-guest-agent
+  - [ bash, -lc, "/usr/local/sbin/arc-onboard.sh" ]
+
+final_message: "cloud-init finished"

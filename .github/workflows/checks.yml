@@ -1,0 +1,395 @@
+name: checks
+
+# CHORE-002. One workflow for everything that can be decided without touching
+# the lab: workflow linting, Terraform formatting and validation, tflint, the
+# Python suites and a secret scan. It replaces lint.yml, which held two of these
+# jobs and said in its own comments that they belonged here.
+#
+# Every job runs on `ubuntu-latest` and none of them takes a secret. That is the
+# point: repository-controlled content is linted, planned and scanned outside the
+# SEC-004 trust boundary, so a pull request gets real feedback without executing
+# next to the Proxmox API token, the Proxmox root SSH password or the Arc
+# service principal. Anything that needs those still runs in terraform-plan.yml
+# on gha-runner-01 - and runs after this, so a broken tree is caught here first.
+#
+# The `checks` job at the bottom is the one to require on main (CHORE-002-A6):
+# it aggregates the others, so adding a job here does not mean editing branch
+# protection, and a skipped job cannot pass as a green required check.
+#
+# It is not actually required today, and cannot be: branch protection and
+# rulesets are both behind a paid plan for private repositories, verified
+# 2026-08-24. Until that changes, a red run here has to block a merge by hand.
+# See "Merging is review is a convention here, not a gate" in
+# docs/runner-trust-boundary.md.
+on:
+  pull_request:
+  push:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+jobs:
+  workflows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # `version` defaults to `latest`, which the action resolves by following the
+      # releases/latest redirect at run time and downloading the tarball with no
+      # checksum check. Pinning the action SHA without pinning this leaves the
+      # tool itself floating: a new actionlint release can redden every open PR
+      # with no commit here. Bump it the same way as any other pin - see
+      # docs/version-pinning.md.
+      - uses: raven-actions/actionlint@3d39aea434753780c3b3d4a1a31c854b4dbf49d7 # v2.2.0
+        with:
+          version: 1.7.12
+          fail-on-error: true
+
+      # actionlint does NOT catch the defect SEC-005 fixed. Its `expression` rule
+      # fires only for a hardcoded list of attacker-writable event fields, so
+      # `inputs.*` and `github.event.inputs.*` inside a `run:` body pass it
+      # clean, and shellcheck never sees the expression because actionlint
+      # replaces it with a placeholder first. Verified against 1.7.12 on the
+      # pre-fix workflow: no findings.
+      #
+      # Without this step the job would not guard the class of bug it was added
+      # for, and a future PR reintroducing the same line would go green.
+      - name: Interpolation guard canary self-test
+        run: python3 .github/scripts/test_assert_no_run_interpolation.py
+
+      # Composite actions are scanned too (BUG-003). `.github/actions/*/action.yml`
+      # carries `run:` bodies with the same expansion semantics as a workflow, so
+      # leaving them out would have meant the guard stopped covering the code the
+      # moment any of it moved into an action.
+      - name: "Assert no expression is interpolated into a run: body"
+        run: python3 .github/scripts/assert_no_run_interpolation.py '.github/workflows/*.yml' '.github/actions/*/action.yml'
+
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.15.9
+          terraform_wrapper: false
+
+      # -recursive because cloudinit/ and any future module directory are as
+      # much part of the configuration as the root. The tree is clean as of
+      # CHORE-002; keeping it clean is cheaper than the next reformatting diff
+      # that hides a real change inside it.
+      - name: terraform fmt
+        run: terraform fmt -check -recursive -diff
+
+      # -backend=false: validation needs the provider schemas, not the state
+      # file on the runner. This job has no business reading or locking it.
+      - name: terraform init
+        run: terraform init -backend=false -input=false
+
+      - name: terraform validate
+        run: terraform validate
+
+      # The tflint `terraform` ruleset is bundled in the binary, so there is no
+      # `tflint --init` and no plugin fetched at run time. See .tflint.hcl.
+      - uses: terraform-linters/setup-tflint@6e1e0642c0289bd619021bf6b34e3c08ed1e005a # v6.3.0
+        with:
+          tflint_version: v0.64.0
+
+      - name: tflint
+        run: tflint --format compact
+
+  python-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The two extractors decide which machines get deleted from Azure. Their
+      # tests were deleted in a7bab38 and are back, rewritten against what the
+      # scripts actually do today - see the file header for why the original
+      # could not simply be restored.
+      - name: Arc extractor tests
+        run: python3 .github/scripts/test_arc_extractors.py
+
+      # BUG-019. The extractors used to return the VM name, which is the Arc
+      # machine name only until someone sets arc.resource_name - and the
+      # override exists so they need not match. This suite is the divergent
+      # case, through both extractors.
+      - name: Arc resource name resolution tests
+        run: python3 .github/scripts/test_arc_registration.py
+
+      # The plan job on the self-hosted runner refuses to publish a plan until
+      # this guard has passed a canary. Running the canary here too means a
+      # broken guard is a red PR rather than a surprise on the lab runner.
+      - name: Leak guard canary self-test
+        run: python3 .github/scripts/test_assert_no_secrets.py
+
+      # BUG-003. render_terraform_env.py decides which value every Terraform run
+      # in every workflow gets for every input variable. A defect there is not a
+      # failed build - it is a plan rendering different user-data than the apply
+      # of the same commit.
+      - name: Terraform environment mapping tests
+        run: python3 .github/scripts/test_render_terraform_env.py
+
+      # SEC-001a. The minter is the only thing standing between a guest and the
+      # long-lived service-principal secret it used to be handed. Its quiet
+      # failure is minting against the wrong cloud - a public-cloud token for a
+      # government subscription authenticates against nothing and fails at first
+      # boot, hours after the run that caused it - so the cloud table is pinned
+      # here, along with every answer the token endpoint can give.
+      - name: Arc token minting tests
+        run: python3 .github/scripts/test_mint_arc_token.py
+
+      # BUG-024. The preflight decides whether an apply is allowed to start at
+      # all. Its failure mode is the quiet one - a guard that waves everything
+      # through looks exactly like a healthy cluster - so every shape it cannot
+      # read is pinned here to block.
+      - name: Cluster preflight tests
+        run: python3 .github/scripts/test_preflight_cluster.py
+
+      # BUG-002. The apply safety guard decides whether an apply that would
+      # create orphan VMs is allowed to run. The version it replaces was wrong
+      # in a way that never showed up as a red build - it just quietly stopped
+      # guarding - so the four inventory/state cases are pinned here.
+      - name: Inventory guard tests
+        run: python3 .github/scripts/test_inventory_guard.py
+
+      # FEAT-001-A3. The backup the restore runbook restores from. A truncated
+      # copy would restore cleanly and then propose to rebuild the lab, so the
+      # suite asserts the copy is identical rather than merely present.
+      - name: State backup tests
+        run: python3 .github/scripts/test_backup_state.py
+
+      # KAN-017-A5. The two decidable checks must block and the Arc check must
+      # not, and a suite that only proved the failing cases would not catch a
+      # check that blocks everything.
+      - name: Post-apply smoke test suite
+        run: python3 .github/scripts/test_postapply_smoke.py
+
+      # The Arc poll's exit condition. It compared counts, and `az resource
+      # list` returns the whole resource group - so machines from elsewhere
+      # satisfied it while the machine just built was absent.
+      - name: Arc poll tests
+        run: python3 .github/scripts/test_arc_missing.py
+
+      # OPS-004. The first case in this suite is not about the API: it asserts
+      # the Windows marker path is the literal we mean, because as an ordinary
+      # string it contains a backslash followed by v, which Python reads as a
+      # vertical tab - so it would have reported every Windows guest as missing
+      # its marker forever, looking exactly like the defect it exists to find.
+      - name: First-boot verification tests
+        run: python3 .github/scripts/test_verify_first_boot.py
+
+      # SEC-001e-A1's tooling. It runs on the runner, not here - but its
+      # behaviour on fixtures is checkable, and the case that matters is that a
+      # clean state file beside a dirty backup is not reported clean.
+      - name: State credential audit tests
+        run: python3 .github/scripts/test_audit_state_secrets.py
+
+      # SEC-001d-A3's tooling. The case that carries it: both templates base64
+      # every free-form value across the template boundary (BUG-010), so a scan
+      # for the raw value would report a snippet clean while the credential
+      # sits in it in full.
+      - name: Node snippet audit tests
+        run: python3 .github/scripts/test_audit_node_snippets.py
+
+      # KAN-017-A5. az_session.sh is shared between arc-cleanup and the
+      # post-apply smoke test, and the two read its exit codes differently -
+      # 2 is a loud skip for one and "nothing to verify" for the other. That
+      # only works if 2 never means anything else.
+      - name: Azure session tests
+        run: python3 .github/scripts/test_az_session.py
+
+      # Written after seventeen dead links were found in one document - and the
+      # document whose whole purpose is to link to the issues it maps. Relative
+      # links must resolve to a file; anything else is an absolute URL.
+      - name: Documentation links resolve
+        run: python3 .github/scripts/check_doc_links.py
+
+      - name: Plan output scanning tests
+        run: python3 .github/scripts/test_check_plan_output_scanned.py
+
+      # KAN-017-A2. `plan`, `apply` and `destroy` all take the state lock and
+      # none of them waited for it, because the concurrency group was believed
+      # to make waiting unnecessary - and that group has never held
+      # terraform-plan.yml. The flag is one word per invocation, which is
+      # exactly the kind of thing that comes off in a rewrite and is noticed
+      # by nobody until two runs collide.
+      - name: Locking Terraform commands wait for the lock
+        run: python3 .github/scripts/check_lock_timeout.py
+
+      - name: Lock-timeout guard canary self-test
+        run: python3 .github/scripts/test_check_lock_timeout.py
+
+      # SEC-003 was only ever enforced on the pull-request path. terraform-plan
+      # captures its plan, scans it, and prints it once clean; terraform-apply
+      # ran `terraform plan -out=tfplan` and let the output go straight to a job
+      # log nobody scanned, and the convergence check printed a second unscanned
+      # plan on its failure path. Neither was a decision - it is what happens
+      # when a rule lives in one file instead of in a check.
+      - name: Printed plans are scanned first
+        run: python3 .github/scripts/check_plan_output_scanned.py
+
+      # The other way a document can be wrong while looking right. A link that
+      # does not resolve is visible; a path holding a vertical tab is not, and
+      # lab-access-required.md carried one inside the single command that
+      # decides whether the Windows first boot ever ran.
+      - name: Documented guest paths exist
+        run: python3 .github/scripts/check_guest_paths.py
+
+      - name: Guest path guard canary self-test
+        run: python3 .github/scripts/test_check_guest_paths.py
+
+      # And that every suite above is actually one of these steps. Fifteen
+      # files, fifteen steps, true today by discipline and by nothing else - a
+      # suite that exists and never runs goes green forever and stops being
+      # evidence of anything.
+      - name: Every test suite is run by CI
+        run: python3 .github/scripts/check_ci_wiring.py
+
+      # DOC-001-A1. The three-way comparison that decides which VMs get
+      # imported, rebuilt or retired. A wrong verdict is worse than no tool -
+      # `pending` mistaken for `missing` means applying instead of importing,
+      # which builds a second VM beside the first - so every verdict has a case.
+      - name: Inventory reconciliation tests
+        run: python3 .github/scripts/test_reconcile_inventory.py
+
+      # OPS-003. The deny-list is written in four files, and #198 edited three:
+      # the README kept describing elastic-01 as an ordinary unmanaged guest
+      # after the factory had started refusing it. The copy that misleads a
+      # person breaks no tool, so nothing went red.
+      - name: The protected VM IDs agree everywhere
+        run: python3 .github/scripts/check_protected_ids.py
+
+      - name: Protected-ID guard canary self-test
+        run: python3 .github/scripts/test_check_protected_ids.py
+
+      # DOC-001. The same failure in the column beside it. #177 measured the
+      # inventory table and #210 rewrote the prose around it; commit 9bf6c57
+      # then commented one entry out of `local.vms`, the apply on that push
+      # destroyed VM 101, and the README went on calling it managed. Two
+      # characters, no red build - which is the whole of DOC-001 (#59)
+      # happening again three hours after it was written up.
+      - name: The README inventory matches local.vms
+        run: python3 .github/scripts/check_managed_inventory.py
+
+      - name: Managed-inventory guard canary self-test
+        run: python3 .github/scripts/test_check_managed_inventory.py
+
+  # BUG-001. The validation rules in locals.tf are only worth having if an
+  # invalid inventory stops the pipeline, so this plans one deliberately broken
+  # inventory per rule and fails unless every one of them is rejected. If the
+  # enforcement in checks.tf ever becomes advisory again, those plans succeed
+  # and this job goes red.
+  #
+  # The fixtures plan against a fake Proxmox token, so the job needs no secret
+  # and no network reach to the hypervisor.
+  config-validation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.15.9
+          # The wrapper exists to expose stdout/stderr as step outputs, which
+          # nothing here reads. The harness runs terraform itself and inspects
+          # the exit code, so it wants the binary, not a shim around it.
+          terraform_wrapper: false
+
+      - name: Configuration validation must block an invalid inventory
+        run: python3 .github/scripts/test_config_validation.py
+
+      # CHORE-005-A3. The other half of the same question. The step above proves
+      # an invalid inventory *stops* a plan; this proves a valid one normalizes
+      # to the shape the resources consume - which is where BUG-006 lived, and
+      # which produces no error to assert on.
+      #
+      # -backend=false is not optional: `terraform test` would otherwise
+      # initialize the local backend and read the state path on the lab runner,
+      # which this job has no business touching. Every run is `command = plan`,
+      # so nothing reaches the hypervisor.
+      - name: Inventory model must normalize as documented
+        run: |
+          terraform init -backend=false -input=false
+          terraform test
+
+      # BUG-021-A4. The hand-written fixtures in test_assert_no_secrets.py pin
+      # what the guard does with a given rendering. This answers the question
+      # underneath the bug - which rendering Terraform actually produces - by
+      # planning a real one and running the guard on the result. It lives in
+      # this job because it is the one that has terraform.
+      - name: Leak guard against real plan output
+        run: python3 .github/scripts/test_assert_no_secrets_real_plan.py
+
+      # BUG-010-A4. Renders both guest templates with a value carrying quotes,
+      # a dollar, a backtick, a comma, an equals and a newline, then decodes it
+      # back - in real bash for the Linux script - and requires it byte for
+      # byte. Here rather than in python-tests for the same reason as the step
+      # above: it needs terraform to do the rendering.
+      - name: Guest templates must not execute a hostile value
+        run: python3 .github/scripts/test_template_injection.py
+
+  # CHORE-002-A5. assert_no_secrets.py checks one plan file for the specific
+  # values CI holds; this checks the whole repository, and its history, for
+  # anything that looks like a credential at all. The two answer different
+  # questions and neither replaces the other.
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history: a credential deleted in a later commit is still a
+          # leaked credential, and `gitleaks git` walks every commit it is given.
+          fetch-depth: 0
+
+      # The binary rather than gitleaks-action: the action resolves the gitleaks
+      # release at run time unless GITLEAKS_VERSION is set, needs an API token to
+      # enumerate the commits of a pull request, and defaults to uploading a
+      # SARIF report of whatever it finds - which is a file full of secret
+      # material, exactly what SEC-002 stopped doing with plan JSON. A pinned
+      # tarball with a checksum is the same tool with none of that.
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          set -euo pipefail
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL -o gitleaks.tar.gz "$url"
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
+          ./gitleaks version
+
+      # --redact so a finding names the file and the rule without reprinting the
+      # secret into a log that is itself readable by everyone with repository
+      # access. The exit code is the signal; the log says where to look.
+      - name: Scan the repository history
+        run: ./gitleaks git . --redact --no-banner --log-opts=--all
+
+      # `git` walks commits; `dir` reads the working tree, including anything
+      # untracked or not yet committed at all.
+      - name: Scan the working tree
+        run: ./gitleaks dir . --redact --no-banner
+
+      - name: Remove the scanner from the workspace
+        if: always()
+        run: rm -f gitleaks gitleaks.tar.gz
+
+  # The check to require on main once the plan allows it (CHORE-002-A6; see the
+  # header). `always()` so it runs even when a job above failed, and every
+  # non-success result - failure, cancelled, or skipped because a dependency
+  # never ran - fails it. A required check that passes when its jobs were
+  # skipped is not a gate.
+  checks:
+    if: always()
+    needs: [workflows, terraform, python-tests, config-validation, secret-scan]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report which jobs failed
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "::error::One or more checks did not succeed: $RESULTS"
+          exit 1
+
+      - name: All checks passed
+        run: echo "All checks passed."

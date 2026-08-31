@@ -1,0 +1,236 @@
+name: terraform-plan
+on:
+  pull_request:
+
+# KAN-017-A2. Not `terraform-lab-state`, and the reason is worth writing down
+# because the obvious change here is the wrong one.
+#
+# This job runs `terraform plan` against the same local backend that
+# terraform-apply and terraform-destroy write, on the same runner, in the same
+# workspace directory. Two documents credited the `terraform-lab-state` group
+# with keeping those three apart; it never held this workflow, so what actually
+# serialises a plan against an apply is that `gha-runner-01` is one runner and
+# runs one job at a time. That is true, undocumented, and not a property of
+# anything in this repository - registering a second runner with these labels
+# would end it silently, which ADR 0004 section 6 already lists as a thing that
+# would change its decision.
+#
+# Adding this workflow to that group would make the claim true and cost more
+# than it buys: GitHub keeps at most one *pending* run per group, so a plan
+# queued for pull request A is cancelled the moment a plan for pull request B
+# queues behind the same apply. A silently cancelled plan on a pull request is
+# worse than the race it would prevent, because the plan is the only review of
+# what will happen to the lab.
+#
+# So: per pull request here, which supersedes a plan the next push has already
+# made stale, and `-lock-timeout` on the plan itself, which is the part that
+# protects the state file no matter how many runners exist.
+concurrency:
+  group: terraform-plan-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+# SEC-004-A3: least privilege at the top level, so a step added later inherits
+# a read-only token rather than the repository default.
+permissions:
+  contents: read
+
+jobs:
+  # SEC-004-A2: `plan` interprets repository-controlled content - locals.tf and
+  # both cloud-init templates are evaluated during `terraform plan` - on a
+  # persistent host that holds the Proxmox API token, the Proxmox root SSH
+  # password and the Arc service principal, with network reach to the
+  # hypervisor. Branches in this repository are pushed by people who already
+  # have write access, so running them there changes nothing. A pull request
+  # from a fork is code from outside that boundary, and must not reach this job.
+  #
+  # This gate is the code half. The other half is a repository setting:
+  # Settings -> Actions -> General -> "Require approval for all external
+  # collaborators". Both are needed; see docs/runner-trust-boundary.md.
+  #
+  # CHORE-006-A2. The fork test above does not exclude Dependabot. Its pull
+  # requests come from `dependabot/*` branches *in this repository*, so
+  # `head.repo.full_name == github.repository` is true for them and they would
+  # otherwise plan on the lab runner.
+  #
+  # The premise of the sentence above - "branches here are pushed by people who
+  # already have write access" - is what a Dependabot PR breaks. Nobody wrote
+  # it, and a provider bump is the case that matters: `terraform init` on this
+  # host downloads a provider version no human has looked at yet, and
+  # `terraform plan` then runs that provider's code next to the credentials,
+  # against the hypervisor. Automating the *proposal* of a bump is the point of
+  # CHORE-006; automating its *execution* inside the trust boundary is not.
+  #
+  # These PRs are not left unchecked - the `checks` workflow runs fmt, validate,
+  # tflint, the Python suites and the secret scan on ubuntu-latest, and a
+  # constraint that disagrees with .terraform.lock.hcl fails `terraform init`
+  # there. What they do not get is a plan against real infrastructure, which
+  # docs/version-pinning.md says to obtain by hand before merging.
+  plan:
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.login != 'dependabot[bot]'
+    runs-on: [self-hosted, gha-runner-01]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.15.9
+          # BUG-023. The shim gives the real binary no stdin and nothing here
+          # reads its outputs - see terraform-apply.yml for the whole story.
+          terraform_wrapper: false
+
+      # BUG-003. Every Terraform step below inherits its input variables from
+      # here. This step used to be a fourteen-line `env:` block repeated on each
+      # of them, which is how the plan step and the apply step came to disagree
+      # about `TF_VAR_windows_admin_password` for the same commit. It runs after
+      # checkout and setup-terraform on purpose: no third-party action executes
+      # with the variables in scope.
+      - uses: ./.github/actions/terraform-env
+        with:
+          secrets: ${{ toJSON(secrets) }}
+          vars: ${{ toJSON(vars) }}
+
+      # SEC-001a. The plan renders the same `templatefile` the apply does, so it
+      # needs the same shape of input. A token here and none at apply - or the
+      # reverse - is BUG-003 again: a reviewed plan whose user-data is not the
+      # user-data that ships.
+      - uses: ./.github/actions/arc-token
+        with:
+          secrets: ${{ toJSON(secrets) }}
+
+      # SEC-004-A4: no workflow step invokes sudo. The runner account had
+      # passwordless sudo purely to create this directory, which handed every
+      # step on the box a root escalation for the sake of one mkdir. The
+      # directory is now created once during runner provisioning - see
+      # docs/runner-trust-boundary.md - and this step only asserts it is there.
+      - name: Verify Terraform state directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          STATE_DIR=/opt/terraform-state/proxmox-ubuntu-vm-factory
+          if [ ! -d "$STATE_DIR" ]; then
+            echo "::error::$STATE_DIR does not exist. Create it during runner provisioning, owned by the runner account. See docs/runner-trust-boundary.md."
+            exit 1
+          fi
+          if [ ! -w "$STATE_DIR" ]; then
+            echo "::error::$STATE_DIR is not writable by $(id -un). Fix ownership during runner provisioning. See docs/runner-trust-boundary.md."
+            exit 1
+          fi
+          echo "State directory present and writable."
+
+      # Proves the leak guard below still fires before it is trusted with a real
+      # plan. A guard that has stopped matching fails the job here.
+      - name: Leak guard canary self-test
+        shell: bash
+        run: python3 .github/scripts/test_assert_no_secrets.py
+
+      - run: terraform init -reconfigure
+
+      - name: Show Terraform state (debug)
+        shell: bash
+        run: |
+          set +e
+          terraform state list 2>/dev/null
+          echo "(terraform state list exit code=$?)"
+          exit 0
+
+      # Captured, not printed. Nothing from this step reaches the log until the
+      # scan below passes, so a regression in the redaction is contained here
+      # rather than published. stderr is captured too - a Terraform error can
+      # quote the value that caused it.
+      - name: Terraform plan (captured)
+        id: plan
+        shell: bash
+        run: |
+          set -uo pipefail
+          rc=0
+          terraform plan -no-color -input=false -lock-timeout=10m > plan.txt 2>&1 || rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          echo "terraform plan exited $rc; output withheld pending the secret scan."
+
+      # The values scanned for are the job's TF_VAR_* variables, set once by the
+      # terraform-env action above. This step names which of them to look for;
+      # it no longer restates where they come from, so it cannot drift from what
+      # the plan step was actually given (BUG-003).
+      #
+      # SEC-001a added TF_VAR_arc_access_token, and it is unlike the rest of the
+      # list: every other name is a value the configuration must never render,
+      # while this one the configuration renders into the snippet on purpose.
+      # It is scanned to prove SEC-003's sensitive() still redacts it. A
+      # short-lived credential published in a plan comment is a live credential
+      # until it expires - shorter than a password's exposure, not zero.
+      #
+      # SECRET_VARS is split on whitespace and commas, so no comment can live
+      # inside the block below: every word in it would be read as a name.
+      - name: Scan captured plan for secret material
+        shell: bash
+        env:
+          SECRET_VARS: |
+            TF_VAR_proxmox_api_token
+            TF_VAR_proxmox_ssh_password
+            TF_VAR_linux_vm_password
+            TF_VAR_windows_admin_password
+            TF_VAR_arc_sp_secret
+            TF_VAR_arc_sp_id
+            TF_VAR_arc_access_token
+            TF_VAR_arc_tenant_id
+            TF_VAR_arc_subscription_id
+        run: python3 .github/scripts/assert_no_secrets.py plan.txt
+
+      - name: Publish plan output
+        shell: bash
+        run: cat plan.txt
+
+      # The exit code reaches bash through `env:` for the same reason the destroy
+      # confirmation does: nothing from an expression context is interpolated
+      # into a script body, so there is one rule to check rather than a
+      # judgement call per site. (SEC-005-A3)
+      - name: Fail the job if terraform plan failed
+        if: steps.plan.outputs.rc != '0'
+        shell: bash
+        env:
+          PLAN_RC: ${{ steps.plan.outputs.rc }}
+        run: |
+          echo "::error::terraform plan exited $PLAN_RC"
+          exit 1
+
+      # Leave nothing behind on the self-hosted runner, including on the path
+      # where the scan refused to publish the file.
+      - name: Remove the captured plan from the workspace
+        if: always()
+        shell: bash
+        run: rm -f plan.txt
+
+  # Fork pull requests land here instead: a hosted runner, no secrets, no lab
+  # network. `-backend=false` keeps it away from the state file on the runner,
+  # so this validates syntax and provider schema only. A fork PR gets real
+  # feedback without anything from outside the trust boundary executing next to
+  # a credential.
+  fork-validate:
+    if: github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.15.9
+          # BUG-023. The shim gives the real binary no stdin and nothing here
+          # reads its outputs - see terraform-apply.yml for the whole story.
+          terraform_wrapper: false
+
+      - name: Explain what does not run here
+        shell: bash
+        run: |
+          echo "::notice::This pull request comes from a fork. It is validated without secrets and is not planned against the lab. A maintainer must re-run the plan from a branch in this repository before merge."
+
+      # Formatting, validation and tflint moved to checks.yml (CHORE-002),
+      # which runs on every pull request including this one - a fork PR gets the
+      # whole hosted gate, not a reduced one. `validate` stays here as well
+      # because it is what this job exists to say: the configuration a fork
+      # proposes was compiled against the provider schema, without a secret and
+      # without the lab.
+      #
+      # No terraform-env step here, deliberately: this job has no secrets to
+      # populate from, and `validate` needs none.
+      - run: terraform init -backend=false -input=false
+      - run: terraform validate

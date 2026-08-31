@@ -1,0 +1,52 @@
+# THIS FILE DOES NOT DESCRIBE THE TEMPLATE. It is kept because it caused two
+# wrong conclusions, and deleting it would leave those corrections referring to
+# something nobody can look at.
+#
+# It was named `cloudbase-init-proxmox.conf.example` and sat beside the two
+# .tftpl files that are read at provision time, which made it look like an input
+# to this factory. It is not read by anything, and it never was.
+#
+# What is actually installed in template 9917 is cloudbase-init.conf.actual,
+# read from a running guest on 2026-08-30 (SPIKE-002-A1). The differences:
+#
+#   plugins                 8 there, 3 here
+#   inject_user_password    true there, absent here
+#   username / groups       set there, absent here
+#   allow_reboot            true there, false here
+#
+# ADR 0003 section 3 reasoned from this file that a password Proxmox writes via
+# cipassword would be applied by nothing, because SetUserPasswordPlugin is
+# absent from the plugin list below. Two things were wrong with that, and the
+# file is only responsible for one: SetUserPasswordPlugin is the OpenStack name
+# and never was the mechanism, and this list is not the template's list.
+#
+# ADR 0001 section 3D's "no cipassword equivalent applies" rested on the same
+# reading, and shaped SEC-001c (#118) for weeks.
+#
+# Keep it, do not follow it, and do not put it back beside the templates as if
+# it were one.
+#
+[DEFAULT]
+metadata_services=cloudbaseinit.metadata.services.configdrive.ConfigDriveService
+
+plugins=cloudbaseinit.plugins.common.userdata.UserDataPlugin,cloudbaseinit.plugins.common.networkconfig.NetworkConfigPlugin,cloudbaseinit.plugins.common.sethostname.SetHostNamePlugin
+
+allow_reboot=false
+first_logon_behaviour=no
+stop_service_on_exit=false
+
+mtu_use_dhcp_config=true
+ntp_use_dhcp_config=true
+
+verbose=true
+debug=true
+log_dir=C:\Program Files\Cloudbase Solutions\Cloudbase-Init\log\
+log_file=cloudbase-init.log
+default_log_levels=comtypes=INFO,suds=INFO,iso8601=WARN,requests=WARN
+
+local_scripts_path=C:\Program Files\Cloudbase Solutions\Cloudbase-Init\LocalScripts\
+check_latest_version=false
+
+[config_drive]
+types=iso,vfat
+locations=cdrom,partition

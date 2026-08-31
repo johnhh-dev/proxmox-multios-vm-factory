@@ -1,0 +1,48 @@
+# CHORE-006. Everything in this repository is pinned - action SHAs, tool
+# versions, the Terraform CLI, the provider constraint and its lock file - for
+# the reason docs/version-pinning.md gives: these workflows run next to the
+# Proxmox API token and the Arc service principal, and a mutable tag means the
+# code executing beside those credentials can change with no commit here.
+#
+# Pinning without a maintenance path is just a slower kind of staleness, so this
+# file is the other half of that decision. It does not cover everything that is
+# pinned - see "What this does not cover" in docs/version-pinning.md - and it is
+# deliberately not a merge-on-green automation. A provider bump can change plan
+# behaviour; that is a review, not a rubber stamp.
+version: 2
+
+updates:
+  # `.github/workflows/` only. The three composite actions under
+  # `.github/actions/` currently declare no third-party `uses:`, so there is
+  # nothing there for Dependabot to update. Add a second entry pointing at them
+  # if that ever changes - Dependabot will not find them on its own.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # One PR at a time. These land on a repository whose merges are a
+    # convention rather than a gate (branch protection is a paid feature for
+    # private repositories - see docs/runner-trust-boundary.md), so a queue of
+    # open bumps is a queue of things nobody is required to look at.
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "CHORE-006"
+    labels:
+      - "chore"
+      - "area:ci-cd"
+
+  # The provider constraint in providers.tf. Note that a bump here and the
+  # checksums in .terraform.lock.hcl are two different things: if the lock file
+  # is not updated alongside the constraint, `terraform init` fails on the
+  # mismatch. That failure surfaces in the `checks` workflow on ubuntu-latest,
+  # not on the lab runner, which is where a failure of this kind belongs.
+  - package-ecosystem: "terraform"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "CHORE-006"
+    labels:
+      - "chore"
+      - "area:terraform"

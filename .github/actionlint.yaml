@@ -1,0 +1,6 @@
+# `gha-runner-01` is the lab's self-hosted runner. Without this, actionlint
+# reports it as an unknown label on every workflow and buries the findings that
+# matter.
+self-hosted-runner:
+  labels:
+    - gha-runner-01

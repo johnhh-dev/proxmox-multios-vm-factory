@@ -1,0 +1,25 @@
+{
+  // Format .tf and .tfvars with `terraform fmt` on save, via the
+  // hashicorp.terraform extension (recommended in .vscode/extensions.json).
+  //
+  // This is a convenience, not the enforcement point - an earlier version of
+  // this comment claimed the opposite and was wrong in a way that cost a red
+  // build. It works only where someone has installed both the extension and a
+  // `terraform` binary on PATH, and neither travels with a clone. terraform-ls
+  // formats by shelling out to the binary, so when it is missing, saving does
+  // nothing at all and says nothing about it. That is how trailing whitespace
+  // reached main after the settings below were added specifically to stop it.
+  //
+  // The `terraform fmt -check` step in .github/workflows/checks.yml is what
+  // actually holds the line: it runs identically no matter whose machine the
+  // commit came from. Treat a red fmt job as the system working, and this file
+  // as the thing that saves you from seeing it.
+  "[terraform]": {
+    "editor.defaultFormatter": "hashicorp.terraform",
+    "editor.formatOnSave": true
+  },
+  "[terraform-vars]": {
+    "editor.defaultFormatter": "hashicorp.terraform",
+    "editor.formatOnSave": true
+  }
+}

@@ -1,0 +1,14 @@
+{
+  // Prompted on first open of this repository in a new window. The Terraform
+  // formatting in .vscode/settings.json is inert without this extension - it is
+  // what terraform-ls, and therefore `terraform fmt` on save, arrives with.
+  //
+  // The extension is half of what that formatting needs. The other half is a
+  // `terraform` binary on PATH, which no editor setting can install: terraform-ls
+  // formats by shelling out to it, and silently does nothing when it is absent.
+  // If saving a .tf file leaves formatting untouched, check `terraform version`
+  // in a terminal before looking at anything here.
+  "recommendations": [
+    "hashicorp.terraform"
+  ]
+}

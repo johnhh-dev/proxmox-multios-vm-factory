@@ -1,0 +1,37 @@
+# The Cloudbase-Init configuration actually installed in template 9917.
+#
+# SPIKE-002-A1. Read from a running guest cloned from that template on
+# 2026-08-29, via `qm guest exec 101`, because ADR 0003 could only say what the
+# repository *suggests* a template should contain and not what one does.
+#
+#   qm guest exec 101 -- powershell.exe -NoProfile -Command \
+#     "Get-Content 'C:\Program Files\Cloudbase Solutions\Cloudbase-Init\conf\cloudbase-init.conf'"
+#
+# It is not the same file as cloudbase-init-proxmox.conf.example beside it, and
+# the differences are load-bearing rather than cosmetic:
+#
+#   plugins                 8 here, 3 in the example
+#   inject_user_password    true here, absent from the example
+#   username / groups       set here, absent from the example
+#   allow_reboot            true here, false in the example
+#   MTU, licensing, ssh keys, local scripts   here only
+#
+# ADR 0003 §3 inferred from the example that a password Proxmox writes via
+# `cipassword` would be applied by nothing, because `SetUserPasswordPlugin` was
+# absent. That inference is withdrawn: the example was stale, the plugin is not
+# the mechanism, and `CreateUserPlugin` with `inject_user_password=true` is —
+# and both are present. See ADR 0001 §9 for what that leaves open.
+#
+# This file is a record, not an input. Nothing reads it, the same way nothing
+# reads the .example beside it — both describe how a template is *built*.
+[DEFAULT]
+username=Administrator
+groups=Administrators
+inject_user_password=true
+first_logon_behaviour=no
+bsdtar_path=C:\Program Files\Cloudbase Solutions\Cloudbase-Init\bin\bsdtar.exe
+mtools_path=C:\Program Files\Cloudbase Solutions\Cloudbase-Init\bin\
+metadata_services=cloudbaseinit.metadata.services.configdrive.ConfigDriveService
+plugins=cloudbaseinit.plugins.common.mtu.MTUPlugin,cloudbaseinit.plugins.common.sethostname.SetHostNamePlugin,cloudbaseinit.plugins.windows.createuser.CreateUserPlugin,cloudbaseinit.plugins.common.networkconfig.NetworkConfigPlugin,cloudbaseinit.plugins.windows.licensing.WindowsLicensingPlugin,cloudbaseinit.plugins.common.sshpublickeys.SetUserSSHPublicKeysPlugin,cloudbaseinit.plugins.common.userdata.UserDataPlugin,cloudbaseinit.plugins.common.localscripts.LocalScriptsPlugin
+allow_reboot=true
+stop_service_on_exit=false

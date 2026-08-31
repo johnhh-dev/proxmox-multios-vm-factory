@@ -1,0 +1,105 @@
+name: Arc cleanup
+description: >-
+  Delete the Azure Arc machine resources named in a file, so a destroyed or
+  replaced VM does not leave a registration behind (BUG-004).
+
+# One implementation, two callers. terraform-apply.yml cleans up VMs that a plan
+# is about to destroy; terraform-destroy.yml cleans up everything in state before
+# tearing the lab down. BUG-004-A2 asks for a composite action rather than a
+# copy, and the reason is BUG-019: the copy in terraform-apply.yml carried a
+# defect for months while the destroy path had no implementation at all to carry
+# it. Two copies means two places to fix and one to forget.
+#
+# Credentials are read from the job environment - TF_VAR_arc_* - which the
+# terraform-env action populates once per job (BUG-003). A composite action
+# cannot read the `secrets` context, and passing five values in through `with:`
+# would be the same drifting block this repository has been removing.
+
+inputs:
+  names-file:
+    description: >-
+      File holding one Arc machine resource name per line. An absent or empty
+      file means there is nothing to clean up, which is not an error.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Delete Arc machine resources
+      shell: bash
+      env:
+        NAMES_FILE: ${{ inputs.names-file }}
+      run: |
+        set -euo pipefail
+
+        # KAN-017-A5. The az presence check, the login, the subscription and the
+        # resource-provider registration used to be inline here. They are
+        # .github/scripts/az_session.sh now, because the post-apply smoke test
+        # needs the same session - and copying them would have been BUG-004's own
+        # mistake, an Arc block duplicated between two callers, committed in the
+        # subsystem that records it.
+        #
+        # BUG-004-A5. Arc is optional for this lab, so an absent credential is a
+        # skip and not a failure - but it is a loud skip. A destroy that silently
+        # left every Arc machine behind is how this issue came to exist. Exit 2
+        # is how the script says "not configured", which is a different answer
+        # from "failed" - and the difference is why the caller decides rather
+        # than the script: a smoke test treats it as nothing to verify, and this
+        # treats it as machines left in Azure.
+        # `bash <script>` rather than executing it: the repository invokes its
+        # scripts explicitly everywhere else (`python3 ...`), and a mode bit is
+        # a poor thing to depend on - it does not survive every checkout, and
+        # the failure is "Permission denied" on the runner rather than anything
+        # a reviewer would see.
+        rc=0
+        bash "$GITHUB_ACTION_PATH/../../scripts/az_session.sh" || rc=$?
+        if [ "$rc" -eq 2 ]; then
+          echo "::notice::Arc cleanup skipped: no Arc credentials are configured for this job. Any Arc machine resources for these VMs will be left in Azure and must be removed by hand."
+          exit 0
+        fi
+        if [ "$rc" -ne 0 ]; then
+          exit "$rc"
+        fi
+
+        # After the credential check, not before it, and the order matters.
+        # On the destroy path the names file is only populated when
+        # TF_VAR_arc_sp_id is set, so a lab with no Arc credentials always
+        # reaches here with an empty file - and checking that first would print
+        # "nothing to delete" and swallow the notice above. BUG-004-A5 asks for
+        # a loud skip precisely because a destroy that silently left every Arc
+        # machine behind is how this issue came to exist.
+        #
+        # The cost is one `az login` on a destroy that had nothing to clean up,
+        # which also means the credentials are proven on every destroy rather
+        # than on the first one that needed them.
+        if [ ! -s "$NAMES_FILE" ]; then
+          echo "Arc cleanup: nothing to delete."
+          exit 0
+        fi
+
+        echo "Arc cleanup: the following Arc machine resources will be deleted:"
+        cat "$NAMES_FILE"
+
+        # BUG-019-A3 / BUG-004-A4. The policy, stated rather than inherited:
+        #
+        #   absent  -> reported and tolerated. Nothing to delete.
+        #   present -> deleted, and a failed delete fails the job.
+        #
+        # The old code was `az resource delete --ids "$ID" || true`, which
+        # reported success in all three cases including "wrong name". A stale
+        # Arc machine blocks re-onboarding under the same name, so a swallowed
+        # failure here surfaces later as an unrelated-looking create failure.
+        # See docs/arc-cleanup.md for why failing before the destroy is the
+        # safer direction to be wrong in.
+        while IFS= read -r NAME; do
+          [ -z "$NAME" ] && continue
+          ID="/subscriptions/$TF_VAR_arc_subscription_id/resourceGroups/$TF_VAR_arc_resource_group/providers/Microsoft.HybridCompute/machines/$NAME"
+          if ! az resource show --ids "$ID" >/dev/null 2>&1; then
+            echo "::warning::Arc resource '$NAME' is not present in $TF_VAR_arc_resource_group, so there is nothing to delete. The extractor expected it to exist - check that this machine was onboarded, and that arc.resource_name matches what it registered as."
+            continue
+          fi
+          echo "Deleting Arc resource: $ID"
+          az resource delete --ids "$ID"
+        done < "$NAMES_FILE"
+
+        echo "Arc cleanup: done."

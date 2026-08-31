@@ -1,0 +1,794 @@
+#ps1_sysnative
+# BUG-017. "Stop" applies to this whole script, and it changes how native
+# commands behave under Windows PowerShell 5.1 - the edition Cloudbase-Init runs
+# this under, because of the #ps1_sysnative header above. Merging a native
+# command's stderr into the success stream with `2>&1` while the preference is
+# "Stop" turns any stderr line into a *terminating* NativeCommandError, so the
+# script aborts on output that was never an error. PowerShell 7 does not do
+# this, so testing under `pwsh` will not reproduce it.
+#
+# Capture native output through Invoke-NativeCapture below. Never with a bare
+# `2>&1`.
+$ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
+
+$LogPath = "C:\cloudbase-firstboot-test.log"
+$TranscriptPath = "C:\cloudbase-firstboot-transcript.log"
+$ArcLogPath = "C:\arc-onboard.log"
+$RunOnceMarker = "C:\ProgramData\vm-factory-firstboot.done"
+
+# BUG-018. The resolvers this guest should use, interpolated from
+# local.dns_servers - the same list the VM resource hands to
+# initialization.dns.servers. This is the only place in this script that
+# names a resolver: both functions below default to it, and the Arc failure
+# message is built from it, so a message cannot go on naming an address the
+# script stopped using.
+$DnsServersConfigured = @(${dns_servers})
+
+# KAN-011-A3. The sources allowed to reach RDP and WinRM on this guest, from
+# var.management_source_cidrs. Empty is the default and means the built-in
+# firewall rules keep the scope they ship with - any remote address - which is
+# what this guest did unconditionally before, and what
+# docs/management-network.md found by reading this file.
+$ManagementSources = @(${management_source_cidrs})
+
+# BUG-010. Decodes a value that crossed the template boundary base64-encoded.
+# See the comment at $passwordPlain for why anything free-form travels that way
+# rather than being interpolated into a quoted PowerShell string.
+function ConvertFrom-Base64Utf8 {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Encoded)
+    if ([string]::IsNullOrEmpty($Encoded)) { return "" }
+    return [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($Encoded))
+}
+
+# KAN-012-A3. The name whose resolution decides the network is ready, from one
+# variable that reaches the Linux template too. It was the literal "aka.ms" in
+# Wait-ForNetworkReady's parameter default, while Linux tested something else
+# entirely - two definitions of the same intent, which is what BUG-018 fixed for
+# the resolvers.
+#
+# Below ConvertFrom-Base64Utf8 rather than beside $DnsServersConfigured, which
+# is where it was first written: function definitions execute in order, so a
+# call placed above the `function` statement fails at runtime with "the term is
+# not recognized". The parser does not object, because parsing is not the
+# problem.
+$NetworkProbeHost = ConvertFrom-Base64Utf8 '${base64encode(network_probe_host)}'
+
+function Write-Log {
+    param([string]$Message)
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+    "$timestamp $Message" | Out-File -FilePath $LogPath -Append -Encoding utf8
+}
+
+function Write-ArcLog {
+    param([string]$Message)
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+    "$timestamp $Message" | Out-File -FilePath $ArcLogPath -Append -Encoding utf8
+}
+
+
+# BUG-017. The one supported way to run a native command here and keep its
+# output. Two things make it safe where a bare `& exe 2>&1` is not:
+#
+#   1. $ErrorActionPreference drops to "Continue" for the duration of the call.
+#      The assignment is function-scoped, so it restores itself on return and
+#      the rest of the script keeps running under "Stop".
+#   2. The outcome is reported by exit code. stderr is captured as text and
+#      never consulted to decide success - a command is entitled to write to
+#      stderr and still succeed, which `azcmagent show` does on every machine
+#      that has not onboarded yet.
+function Invoke-NativeCapture {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath,
+        [string[]]$Arguments = @()
+    )
+
+    $ErrorActionPreference = "Continue"
+
+    # Cleared first, so a command that never launches cannot be read as the
+    # success of whatever ran before it.
+    $global:LASTEXITCODE = 0
+    $output = & $FilePath @Arguments 2>&1
+    $exitCode = $LASTEXITCODE
+
+    # Under 5.1 each captured stderr line arrives as an ErrorRecord, and
+    # Out-String renders those as a full positional error - source line, caret,
+    # CategoryInfo, the lot. That is noise in arc-onboard.log, and it buries the
+    # one line azcmagent actually wrote. Take the message and drop the framing.
+    $text = ($output | ForEach-Object {
+        if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message } else { $_ }
+    } | Out-String).Trim()
+
+    [pscustomobject]@{
+        Text     = $text
+        ExitCode = $exitCode
+    }
+}
+
+function Set-StaticDnsServers {
+    param(
+        [string[]]$Servers = $DnsServersConfigured
+    )
+    try {
+        $upAdapters = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.HardwareInterface -eq $true }
+        foreach ($adapter in $upAdapters) {
+            try {
+                Set-DnsClientServerAddress -InterfaceIndex $adapter.InterfaceIndex -ServerAddresses $Servers -ErrorAction Stop
+                Write-Log ("DNS servers set on {0}: {1}" -f $adapter.Name, ($Servers -join ", "))
+            } catch {
+                Write-Log ("Failed to set DNS on {0}: {1}" -f $adapter.Name, $_.Exception.Message)
+            }
+        }
+    } catch {
+        Write-Log ("Set-StaticDnsServers failed: " + $_.Exception.Message)
+    }
+}
+
+function Set-ManagementRuleScope {
+    # KAN-011-A3. Narrow an enabled rule group to the approved sources.
+    #
+    # Enabling a built-in group leaves its scope alone, and the built-in scope
+    # is any remote address. Set-NetFirewallRule -RemoteAddress is what changes
+    # it, and it has to run after Enable-NetFirewallRule rather than instead of
+    # it: the two settings are independent, and a rule can be scoped and off.
+    #
+    # Reports rather than throws, like Set-StaticDnsServers above and for the
+    # same reason - this runs inside first boot, and a guest that failed to
+    # narrow a firewall rule is still a guest worth finishing. The log line is
+    # the record, and it states which of the two outcomes happened rather than
+    # only the good one, because "no restriction" is a decision here and not an
+    # absence.
+    param(
+        [Parameter(Mandatory = $true)][string]$DisplayGroup,
+        [string[]]$Sources = $ManagementSources
+    )
+
+    if ($Sources.Count -eq 0) {
+        Write-Log ("{0}: reachable from ANY source - var.management_source_cidrs is empty, so the built-in rule keeps its default scope (KAN-011)." -f $DisplayGroup)
+        return
+    }
+
+    try {
+        Set-NetFirewallRule -DisplayGroup $DisplayGroup -RemoteAddress $Sources -ErrorAction Stop
+        Write-Log ("{0}: restricted to {1}" -f $DisplayGroup, ($Sources -join ", "))
+    } catch {
+        Write-Log ("{0}: FAILED to restrict to {1} - the rule is enabled and still accepts any source: {2}" -f $DisplayGroup, ($Sources -join ", "), $_.Exception.Message)
+    }
+}
+
+function Enable-ManagementLogging {
+    # KAN-011-A6. Nothing logged an inbound connection to a guest.
+    #
+    # docs/management-network.md matrixed sixteen management flows and found two
+    # things that needed no measurement. The first was that the rules this
+    # repository enables were enabled for any remote address, which KAN-011-A3
+    # answered with $ManagementSources above. This is the second: **not one
+    # inbound flow to a guest is logged anywhere**, so "who reached RDP on this
+    # machine" had no answer, and KAN-011's criterion that connection events be
+    # retained somewhere the owner can review had nothing behind it.
+    #
+    # Both halves are enabled deliberately. Dropped connections are the evidence
+    # that a narrowed rule is doing its job - A6's negative tests are the ones
+    # that matter, and a denial that leaves no trace cannot be shown to have
+    # happened. Allowed connections are the other half of the same question: a
+    # rule scoped to the VPN range is only useful if what got through can be
+    # named.
+    #
+    # 4 MB is the cap, per profile. Windows rotates to pfirewall.log.old at that
+    # point and keeps exactly one, so the ceiling is 8 MB per profile and the
+    # disk cannot fill - which matters because this runs on a guest nobody is
+    # watching. It also means the record is short: on a busy host these are
+    # hours of history, not weeks. Shipping them somewhere is out of this
+    # repository's scope and is where A6 ends and a log collector begins.
+    #
+    # Reports rather than throws, like Set-ManagementRuleScope and
+    # Set-StaticDnsServers - a guest that failed to turn logging on is still a
+    # guest worth finishing, and the log line says which of the two happened.
+    $logFile = "$${env:SystemRoot}\System32\LogFiles\Firewall\pfirewall.log"
+
+    try {
+        Set-NetFirewallProfile -All `
+            -LogAllowed True -LogBlocked True `
+            -LogFileName $logFile -LogMaxSizeKilobytes 4096 -ErrorAction Stop
+        Write-Log ("Firewall logging enabled (allowed and dropped, 4096 KB per profile): " + $logFile)
+    } catch {
+        # The netsh fallback exists for the same reason the two rule groups
+        # above have one: an image where the NetSecurity module is absent or
+        # broken still has netsh, and this is not worth failing first boot over.
+        try {
+            netsh advfirewall set allprofiles logging filename $logFile | Out-Null
+            netsh advfirewall set allprofiles logging maxfilesize 4096 | Out-Null
+            netsh advfirewall set allprofiles logging droppedconnections enable | Out-Null
+            netsh advfirewall set allprofiles logging allowedconnections enable | Out-Null
+            Write-Log ("Firewall logging enabled via netsh: " + $logFile)
+        } catch {
+            Write-Log ("Firewall logging NOT enabled - inbound connections to this guest are unrecorded (KAN-011-A6): " + $_.Exception.Message)
+        }
+    }
+}
+
+function Set-HostnameImmediateBestEffort {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$NewName
+    )
+
+    $rebootRequired = $false
+    try {
+        # BUG-007-A3. These two lines used the template literal while every
+        # other line in the function used $NewName. It worked only because the
+        # single call site passes the same value - a function that declares a
+        # mandatory parameter and then ignores it is a trap for whoever adds a
+        # second caller, and it makes the parameter look load-bearing when it
+        # was decorative.
+        if ($env:COMPUTERNAME -ne $NewName) {
+            Rename-Computer -NewName $NewName -Force -ErrorAction Stop
+            $rebootRequired = $true
+            Write-Log ("Rename-Computer invoked for: {0}" -f $NewName)
+        }
+
+        $registryPaths = @(
+            'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName',
+            'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ActiveComputerName'
+        )
+        foreach ($path in $registryPaths) {
+            try {
+                Set-ItemProperty -Path $path -Name ComputerName -Value $NewName -Force
+            } catch {
+                Write-Log ("Failed registry hostname update in {0}: {1}" -f $path, $_.Exception.Message)
+            }
+        }
+
+        try {
+            Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' -Name Hostname -Value $NewName -Force
+            Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' -Name "NV Hostname" -Value $NewName -Force
+            Write-Log ("TCP/IP hostname registry updated to: {0}" -f $NewName)
+        } catch {
+            Write-Log ("Failed TCP/IP hostname update: " + $_.Exception.Message)
+        }
+
+        # BUG-007-A5. The one property chain the sweep found that a try/catch
+        # was carrying rather than a check. Get-WmiObject can return nothing
+        # without failing, and $null.Rename() then throws into the catch below,
+        # which logs "WMI rename attempt failed" and an exception message about
+        # a null-valued expression - a true statement about the wrong thing.
+        # The catch stays for the call itself; this only stops it being the
+        # first line of defence.
+        try {
+            $cs = Get-WmiObject -Class Win32_ComputerSystem
+            if ($null -eq $cs) {
+                Write-Log "WMI rename skipped: Win32_ComputerSystem returned nothing"
+            } elseif ($cs.Rename($NewName).ReturnValue -eq 0) {
+                Write-Log ("WMI rename accepted for: {0}" -f $NewName)
+                $rebootRequired = $true
+            }
+        } catch {
+            Write-Log ("WMI rename attempt failed: " + $_.Exception.Message)
+        }
+
+        # BUG-007-A2. This was `$script:env:COMPUTERNAME`, which is not a thing:
+        # `script:` is a scope modifier and `env:` is a PSDrive qualifier, and
+        # they do not stack. PowerShell does not object - it quietly creates a
+        # script-scoped variable whose *name* is the string "env:COMPUTERNAME"
+        # and leaves the real environment variable alone. So the line read as
+        # an assignment and did nothing, silently, which is the worst of both.
+        #
+        # Both halves are kept because they do different jobs: this one updates
+        # the current process so anything later in this script sees the new
+        # name, and SetEnvironmentVariable persists it for every process after
+        # the reboot.
+        $env:COMPUTERNAME = $NewName
+        [Environment]::SetEnvironmentVariable('COMPUTERNAME', $NewName, 'Machine')
+
+        try {
+            ipconfig /registerdns | Out-Null
+            ipconfig /release | Out-Null
+            Start-Sleep -Seconds 2
+            ipconfig /renew | Out-Null
+            Write-Log ("DHCP lease renewed after hostname change: {0}" -f $NewName)
+        } catch {
+            Write-Log ("DHCP renew after hostname change failed: " + $_.Exception.Message)
+        }
+
+        if ($rebootRequired) {
+            Write-ArcLog "Hostname change requested; full Windows rename still requires reboot"
+        }
+    } catch {
+        Write-Log ("Set-HostnameImmediateBestEffort failed: " + $_.Exception.Message)
+        throw
+    }
+}
+
+# SEC-008-A2. Autologon is configured for exactly one logon, and Windows does
+# retire the *mechanism* on its own: AutoLogonCount reaches zero and
+# AutoAdminLogon is cleared. What it does not do is remove DefaultPassword, so
+# the administrator password stayed in the registry as cleartext REG_SZ,
+# readable by any local administrator, for the life of the machine. A decrement
+# is not a cleanup.
+#
+# Deliberately non-fatal in every branch. This runs under
+# $ErrorActionPreference = "Stop", and it is called on the path that ends in
+# `exit 0` - a throw here would turn "second boot, nothing to do" into a failed
+# provisioning run, which is the BUG-007 failure shape and not worth risking to
+# tidy a registry value.
+function Remove-AutologonCredential {
+    $winlogon = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+
+    # DefaultPassword is the one that matters. The other two go with it so
+    # nothing is left advertising an autologon that has no credential behind it.
+    foreach ($name in @('DefaultPassword', 'DefaultUserName', 'AutoAdminLogon')) {
+        try {
+            $existing = Get-ItemProperty -Path $winlogon -Name $name -ErrorAction SilentlyContinue
+            if ($null -eq $existing) {
+                continue
+            }
+            Remove-ItemProperty -Path $winlogon -Name $name -ErrorAction Stop
+            Write-Log ("Removed Winlogon value: " + $name)
+        } catch {
+            Write-Log ("Could not remove Winlogon value " + $name + ": " + $_.Exception.Message)
+        }
+    }
+}
+
+function Wait-ForNetworkReady {
+    param(
+        [string[]]$DnsServers = $DnsServersConfigured,
+        [string]$TestHost = $NetworkProbeHost,
+        [int]$MaxAttempts = 30,
+        [int]$SleepSeconds = 10
+    )
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            $hasGateway = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Where-Object { $_.NextHop -and $_.NextHop -ne '0.0.0.0' } | Select-Object -First 1
+            $dnsOk = $false
+            foreach ($dns in $DnsServers) {
+                try {
+                    Resolve-DnsName -Name $TestHost -Server $dns -ErrorAction Stop | Out-Null
+                    $dnsOk = $true
+                    break
+                } catch {}
+            }
+
+            $tcpOk = $false
+            try {
+                $tcpOk = Test-NetConnection -ComputerName $TestHost -Port 443 -InformationLevel Quiet -WarningAction SilentlyContinue
+            } catch {}
+
+            Write-Log ("Network wait attempt {0}/{1}: gateway={2}, dns={3}, tcp443={4}" -f $attempt, $MaxAttempts, [bool]$hasGateway, $dnsOk, $tcpOk)
+
+            if ($hasGateway -and $dnsOk -and $tcpOk) {
+                Write-Log "Network is ready for Azure Arc"
+                return $true
+            }
+        } catch {
+            Write-Log ("Network readiness check error: " + $_.Exception.Message)
+        }
+        Start-Sleep -Seconds $SleepSeconds
+    }
+
+    return $false
+}
+
+try {
+    Start-Transcript -Path $TranscriptPath -Append | Out-Null
+} catch {}
+
+if (Test-Path $RunOnceMarker) {
+    # SEC-008-A2. Reaching here means first boot completed and the machine has
+    # restarted, so the one-time autologon has already served its purpose. The
+    # credential that made it work comes out of the registry now.
+    #
+    # This branch rather than a RunOnce entry: the restart at the end of first
+    # boot exists precisely so that a second boot lands here, so the cleanup
+    # rides the trigger the run-once design already depends on. A RunOnce value
+    # would mean nesting a reg.exe command line inside a PowerShell string
+    # inside a Terraform template, which is exactly BUG-010's failure mode for
+    # the sake of a path this one already covers.
+    Remove-AutologonCredential
+
+    Write-Log "Run-once marker exists, exiting without changes"
+    try { Stop-Transcript | Out-Null } catch {}
+    exit 0
+}
+
+# BUG-010. Decoded once, here, and used everywhere below - the log lines that
+# follow and the azcmagent arguments much further down. None of these arrives
+# validated: they come from repository secrets as free text, and a
+# double-quoted PowerShell string expands $name and honours a backtick, so
+# `Write-ArcLog "arc_location=$${arc_location}"` was as much an interpolation
+# site as the ones that build a command. See $passwordPlain below for why the
+# transport is base64 rather than escaping.
+#
+# $arcResourceName is not decoded, deliberately: it is validated at plan time
+# against ^[A-Za-z0-9][A-Za-z0-9._-]*$ (BUG-020-A4) and cannot carry a
+# metacharacter. $arc_enabled and $hostname are left inline for the same
+# reason - a bool, and a name held to a DNS label by BUG-020-A1.
+$arcSubscriptionId = ConvertFrom-Base64Utf8 '${base64encode(arc_subscription_id)}'
+$arcTenantId       = ConvertFrom-Base64Utf8 '${base64encode(arc_tenant_id)}'
+$arcResourceGroup  = ConvertFrom-Base64Utf8 '${base64encode(arc_resource_group)}'
+$arcLocation       = ConvertFrom-Base64Utf8 '${base64encode(arc_location)}'
+$arcAccessToken    = ConvertFrom-Base64Utf8 '${base64encode(arc_access_token)}'
+$arcCloud          = ConvertFrom-Base64Utf8 '${base64encode(arc_cloud)}'
+$arcTags           = ConvertFrom-Base64Utf8 '${base64encode(arc_tags)}'
+$arcResourceName   = '${arc_resource_name}'
+
+Write-Log "Starting Cloudbase first-boot script"
+Write-Log "Template hostname: ${hostname}"
+Write-ArcLog "=== Azure Arc onboarding start ==="
+Write-ArcLog "arc_enabled=${arc_enabled}"
+Write-ArcLog ("arc_resource_name=" + $arcResourceName)
+Write-ArcLog ("arc_resource_group=" + $arcResourceGroup)
+Write-ArcLog ("arc_location=" + $arcLocation)
+Write-ArcLog ("arc_cloud=" + $arcCloud)
+
+# BUG-010. This was an expandable here-string - @" ... "@ - with the password
+# substituted into it by `templatefile` before PowerShell ever ran. PowerShell
+# then expanded what it found: a password containing `$env:USERNAME` became the
+# username, one containing a backtick lost it as an escape, and
+# `$(Get-Process)` would have run. The guest ends up with a password that is
+# not the one in the secret, and nothing says so - RDP simply refuses the
+# credential the operator thinks they set.
+#
+# Base64 removes the question rather than escaping it: the alphabet is
+# A-Za-z0-9+/= so the encoded form cannot contain a quote, a dollar, a backtick
+# or a newline, whatever the password is. The single-quoted literal below is
+# therefore safe by construction, not by inspection.
+#
+# The .Trim() the here-string needed is gone with it - base64 round-trips the
+# exact bytes, so there is no trailing newline of the template's own making to
+# strip, and trimming would now corrupt a password that legitimately ends in
+# whitespace.
+$passwordPlain = [System.Text.Encoding]::UTF8.GetString(
+    [System.Convert]::FromBase64String('${base64encode(windows_admin_password)}')
+)
+
+if ([string]::IsNullOrWhiteSpace($passwordPlain)) {
+    throw "windows_admin_password is empty. Set GitHub secret TF_VAR_WINDOWS_ADMIN_PASSWORD or WINDOWS_ADMIN_PASSWORD."
+}
+
+# SEC-001c-A2. This logged the administrator password's *length* into
+# C:\cloudbase-firstboot-test.log, which is readable by any local account. A
+# length is not the password, and it is not nothing either - it removes every
+# candidate of a different length from anyone guessing. It was a debugging line
+# from before the base64 decode was trusted, and the decode is checked on the
+# line above by a different means: an empty result throws.
+
+# Enable built-in Administrator and set password
+cmd /c "net user Administrator /active:yes" | Out-Null
+
+# SEC-008-A1. This ran `net user Administrator <password>` through
+# Start-Process, which put the password in a process command line. A command
+# line is not a secret on Windows: any local account can read it out of
+# Win32_Process while the process lives, and process-creation auditing or an
+# EDR agent will happily persist it somewhere with a longer retention than the
+# process had.
+#
+# Set-LocalUser takes a SecureString and builds no command line. It also gives
+# $securePassword the reason to exist that BUG-015 observed it did not have -
+# it was constructed here and then discarded in favour of the cleartext path.
+#
+# Set-LocalUser is from Microsoft.PowerShell.LocalAccounts, which raises no
+# floor this script did not already stand on: Get-NetAdapter,
+# Set-DnsClientServerAddress, Enable-NetFirewallRule, Rename-Computer and
+# Enable-PSRemoting are all used above and are the same generation of cmdlet.
+$securePassword = ConvertTo-SecureString $passwordPlain -AsPlainText -Force
+try {
+    Set-LocalUser -Name "Administrator" -Password $securePassword -ErrorAction Stop
+    Write-Log "Administrator password applied"
+} catch {
+    Write-Log "Administrator password failed: $($_.Exception.Message)"
+    throw
+}
+
+# Set DNS early so Arc download has working name resolution
+Set-StaticDnsServers
+
+# Rename host with best-effort immediate DHCP/DNS visibility before reboot
+Set-HostnameImmediateBestEffort -NewName "${hostname}"
+
+# SEC-001c-A4, and this is where ADR 0001 path 8 closes by default.
+#
+# SEC-008-A3 kept autologon and cut its lifetime to one logon, for three stated
+# reasons. The first still holds: Cloudbase-Init runs as a service and nothing
+# in provisioning needs an interactive desktop, so this was never required to
+# build a machine - it was here for a human's first look at it.
+#
+# The second has expired. It was "no Windows guest exists in local.vms to test
+# the removal against (DOC-001, #59)", and local.vms carries win-srv-01 now.
+#
+# The third - that a first boot which quietly stops producing a usable desktop
+# is worse than one registry value with a bounded life - is answered by what
+# this same script does twenty lines below: it enables RDP and opens the
+# firewall for it. The first look at the machine is an RDP session with the
+# administrator password. Autologon was buying a *second* way in, and paying
+# for it by putting that password in the registry as cleartext REG_SZ.
+#
+# So the default is off, and the mechanism is kept for a VM that asks. When it
+# does ask, SEC-008-A2's lifetime is unchanged: one logon, and
+# Remove-AutologonCredential deletes DefaultPassword on the next boot.
+%{ if windows_autologon ~}
+reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v AutoAdminLogon /t REG_SZ /d 1 /f | Out-Null
+reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v DefaultUserName /t REG_SZ /d Administrator /f | Out-Null
+
+# SEC-008-A1, second site. The four lines around this one are still `reg add`
+# because none of them carries a secret; this one is not, because it did. It
+# passed the password as an argument to reg.exe, which is the same command-line
+# exposure as the `net user` call above and was not named separately in the
+# finding. Set-ItemProperty writes the value in-process, so no command line is
+# ever built for it.
+Set-ItemProperty `
+    -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' `
+    -Name 'DefaultPassword' -Value $passwordPlain -Type String
+
+reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v AutoLogonCount /t REG_DWORD /d 1 /f | Out-Null
+reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v Shell /t REG_SZ /d explorer.exe /f | Out-Null
+Write-Log "One-time autologon configured - the administrator password is in HKLM Winlogon DefaultPassword until the next boot (windows.autologon)."
+%{ else ~}
+Write-Log "Autologon not configured (SEC-001c). Reach this machine over RDP, enabled below."
+%{ endif ~}
+
+# SEC-001c-A2. Every consumer of the plaintext password has now run:
+# Set-LocalUser above, and the autologon branch if it was taken. Dropping the
+# variables here bounds how long the value is in this process to the twenty or
+# so lines that need it, rather than to the whole of first boot - which
+# downloads and runs an installer, onboards to Azure and then reboots.
+#
+# This is a small thing and is not pretending to be the fix. The password is
+# still in the *script text* that PowerShell is reading from, and that is where
+# it cannot be removed from - see ADR 0001 section 9.
+# Dispose() on the SecureString is the part that actually zeroes anything -
+# SecureString owns unmanaged memory and clears it. Setting $passwordPlain to
+# $null only drops a reference: the .NET string it pointed at is immutable and
+# stays in the managed heap until a collection happens to reclaim it, and
+# forcing one would not guarantee otherwise. Dropping the reference is what
+# PowerShell offers, so that is what this claims to do.
+if ($null -ne $securePassword) { $securePassword.Dispose() }
+$securePassword = $null
+$passwordPlain = $null
+
+# KAN-011-A6. Before either management rule group is enabled, so the first
+# connection that arrives is already recorded.
+Enable-ManagementLogging
+
+# Enable RDP
+reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections /t REG_DWORD /d 0 /f | Out-Null
+try {
+    Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
+} catch {
+    netsh advfirewall firewall set rule group="remote desktop" new enable=Yes | Out-Null
+}
+Write-Log "RDP enabled"
+Set-ManagementRuleScope -DisplayGroup "Remote Desktop"
+
+# Azure Arc
+$arcFailed = $false
+if ("${arc_enabled}" -ne "true") {
+    Write-ArcLog "Azure Arc: disabled for this VM"
+} else {
+    # BUG-010. Built from the values decoded once near the top of the script,
+    # not interpolated again here.
+    $required = @{
+        arc_subscription_id = $arcSubscriptionId
+        arc_tenant_id       = $arcTenantId
+        arc_resource_group  = $arcResourceGroup
+        arc_location        = $arcLocation
+        arc_access_token    = $arcAccessToken
+    }
+
+    $missing = @($required.GetEnumerator() | Where-Object { [string]::IsNullOrWhiteSpace($_.Value) } | ForEach-Object { $_.Key })
+    if ($missing.Count -gt 0) {
+        Write-ArcLog ("Azure Arc: required values missing, skipping connect: " + ($missing -join ", "))
+    } else {
+        try {
+            $azcmExe = Join-Path $${env:ProgramFiles} 'AzureConnectedMachineAgent\azcmagent.exe'
+            if (-not (Wait-ForNetworkReady -TestHost "aka.ms" -MaxAttempts 30 -SleepSeconds 10)) {
+                throw "Network not ready for Azure Arc after waiting; DNS servers expected: $($DnsServersConfigured -join ', ')"
+            }
+
+            if (-not (Test-Path $azcmExe)) {
+                Write-ArcLog "azcmagent missing, installing agent"
+                $msiPath = Join-Path $env:TEMP 'AzureConnectedMachineAgent.msi'
+                Invoke-WebRequest -UseBasicParsing -Uri "https://aka.ms/AzureConnectedMachineAgent" -OutFile $msiPath
+                $install = Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i', $msiPath, '/qn', '/norestart') -Wait -PassThru -NoNewWindow
+                if ($install.ExitCode -ne 0) {
+                    throw "Azure Connected Machine Agent install failed with exit code $($install.ExitCode)"
+                }
+                Start-Sleep -Seconds 5
+            } else {
+                Write-ArcLog "azcmagent already installed"
+            }
+
+            if (-not (Test-Path $azcmExe)) {
+                throw "azcmagent.exe not found after install"
+            }
+
+            # A non-zero exit is not fatal here: `azcmagent show` fails on a
+            # machine that has never connected, which is the first-boot case
+            # every time. Record it and let the connect below decide.
+            $show = Invoke-NativeCapture -FilePath $azcmExe -Arguments @('show')
+            $showText = $show.Text
+            if ($show.ExitCode -ne 0) {
+                Write-ArcLog ("azcmagent show exited with code {0}" -f $show.ExitCode)
+            }
+
+            # Guarded because Select-String yields nothing when the agent is
+            # freshly installed or the build is localised, and the old property
+            # chain then called .Trim() on $null - the same abort BUG-017 is
+            # about, reached by a different route. The wider sweep for unguarded
+            # property chains stays with BUG-007.
+            $statusMatch = $showText | Select-String -Pattern 'Agent Status\s*:\s*(.+)' | Select-Object -First 1
+            if ($statusMatch) {
+                Write-ArcLog ("Current azcmagent status: " + $statusMatch.Matches.Groups[1].Value.Trim())
+            } else {
+                Write-ArcLog "azcmagent show output available but Agent Status not parsed"
+            }
+
+            if ($showText -match '(?im)^\s*Status\s*:\s*Connected\s*$' -or $showText -match '(?im)^\s*Agent Status\s*:\s*Connected\s*$') {
+                Write-ArcLog "Azure Arc: machine already connected, skipping connect"
+            } else {
+                # SEC-001a. `azcmagent --config` reads a JSON file whose keys
+                # are the long flag names. The token goes there and nowhere
+                # else: a process argument is readable by anything that can
+                # enumerate processes, which on a machine mid-first-boot
+                # includes every service that starts alongside this script.
+                #
+                # Only the token is in the file. Tags and the resource name are
+                # not credentials, and leaving them as arguments avoids
+                # JSON-escaping operator-supplied strings - BUG-010's failure
+                # mode from a new direction. A JWT is base64url and dots.
+                #
+                # Hardening the file itself - ACLs, a location outside %TEMP% -
+                # belongs to SEC-001c (#118), which does that work for the
+                # Windows administrator password at the same time.
+                $connectConfig = Join-Path $env:TEMP ("arc-connect-{0}.json" -f [guid]::NewGuid().ToString('N'))
+
+                try {
+                    @{ 'access-token' = $required.arc_access_token } |
+                        ConvertTo-Json -Compress |
+                        Set-Content -Path $connectConfig -Encoding ascii -Force
+
+                    # BUG-010. Variables decoded above, not interpolated here. A
+                    # single-quoted PowerShell literal does not expand $name,
+                    # which is why these sites were less exposed than the
+                    # double-quoted ones - but a value containing an apostrophe
+                    # still closes the literal early, and none of these is
+                    # validated at plan time. They are array elements, so
+                    # azcmagent receives each as one argument no matter what it
+                    # contains; there is no command line for a quote to break.
+                    $connectArgs = @(
+                        'connect',
+                        '--config', $connectConfig,
+                        '--tenant-id', $required.arc_tenant_id,
+                        '--subscription-id', $required.arc_subscription_id,
+                        '--resource-group', $required.arc_resource_group,
+                        '--location', $required.arc_location,
+                        '--cloud', $arcCloud
+                    )
+
+                    if (-not [string]::IsNullOrWhiteSpace($arcResourceName)) {
+                        $connectArgs += @('--resource-name', $arcResourceName)
+                    }
+                    if (-not [string]::IsNullOrWhiteSpace($arcTags)) {
+                        $connectArgs += @('--tags', $arcTags)
+                    }
+
+                    Write-ArcLog "Running azcmagent connect"
+                    $connect = Invoke-NativeCapture -FilePath $azcmExe -Arguments $connectArgs
+                    if ($connect.Text) {
+                        $connect.Text | Out-File -FilePath $ArcLogPath -Append -Encoding utf8
+                    }
+                    if ($connect.ExitCode -ne 0) {
+                        throw "azcmagent connect failed with exit code $($connect.ExitCode)"
+                    }
+                    Write-ArcLog "Azure Arc: connect succeeded"
+                } finally {
+                    # finally, not a trailing call: the throw above is the most
+                    # likely exit from this block, and it is the path where
+                    # leaving a live token on disk would matter most.
+                    Remove-Item -Path $connectConfig -Force -ErrorAction SilentlyContinue
+                }
+            }
+        } catch {
+            # This rethrew, which aborted the script before the run-once marker
+            # was written - so one failed onboarding made every later boot redo
+            # the Administrator password, the autologon and the rename, forever.
+            # Arc is the last thing first boot does and nothing below depends on
+            # it, so record the failure and let the run finish. (BUG-007-A6.)
+            $arcFailed = $true
+            Write-ArcLog ("Azure Arc onboarding failed: " + $_.Exception.Message)
+            Write-Log ("Azure Arc onboarding failed, continuing first boot: " + $_.Exception.Message)
+        }
+    }
+}
+
+# Enable WinRM without blocking the rest of first boot
+%{ if windows_enable_winrm ~}
+try {
+    winrm quickconfig -q | Out-Null
+    Set-Service -Name WinRM -StartupType Automatic
+    Start-Service -Name WinRM -ErrorAction SilentlyContinue
+    Enable-PSRemoting -Force -SkipNetworkProfileCheck -ErrorAction Stop | Out-Null
+    # KAN-015. This is where SEC-008-A5's recorded finding is acted on, and the
+    # two branches below are the finding and its absence.
+    #
+    # What was here unconditionally:
+    #
+    #   winrm set winrm/config/service/auth '@{Basic="true"}'
+    #   winrm set winrm/config/service '@{AllowUnencrypted="true"}'
+    #
+    # Basic sends the username and password base64-encoded, which is encoding
+    # and not encryption, and AllowUnencrypted turns off the transport
+    # protection that would otherwise cover it. Together they put the
+    # administrator credential on the wire in recoverable form, over HTTP on
+    # port 5985, to anyone able to observe the lab network - a strictly worse
+    # exposure than the command line and the registry value SEC-008 closed,
+    # because those are readable by local accounts and this one is readable by
+    # the network.
+    #
+    # The default branch now sets nothing. That is the whole mechanism: with no
+    # `winrm set` at all the service keeps what `winrm quickconfig` and
+    # Enable-PSRemoting leave it - Negotiate on, Basic off, AllowUnencrypted
+    # off - and Negotiate encrypts the payload at the message layer, so the
+    # credential is not on the wire in recoverable form even though the
+    # transport is still HTTP.
+    #
+    # The cost lands on the client, not on this guest: connecting to a
+    # workgroup machine over Negotiate requires the *connecting* host to trust
+    # it first. docs/windows-winrm.md carries that procedure, and the symptom
+    # of not having done it is an immediate WinRM error naming TrustedHosts.
+    #
+    # An HTTPS listener on 5986 is still the better answer and is still not
+    # here: it needs a certificate from a CA the lab trusts, which is SEC-006's
+    # (#55) prerequisite, and a self-signed one only moves the client to
+    # -SkipCACheck. See docs/windows-winrm.md for what it would take.
+%{ if windows_winrm_allow_unencrypted ~}
+    winrm set winrm/config/service/auth '@{Basic="true"}' | Out-Null
+    winrm set winrm/config/service '@{AllowUnencrypted="true"}' | Out-Null
+    Write-Log "WinRM: Basic authentication over an unencrypted transport is ENABLED for this guest (windows.winrm_allow_unencrypted). The administrator credential is recoverable from the wire on port 5985."
+%{ else ~}
+    Write-Log "WinRM: Negotiate only - Basic and unencrypted transport left off (KAN-015). A workgroup client must add this host to TrustedHosts first; see docs/windows-winrm.md."
+%{ endif ~}
+    try {
+        Enable-NetFirewallRule -DisplayGroup "Windows Remote Management" | Out-Null
+    } catch {
+        netsh advfirewall firewall set rule group="windows remote management" new enable=Yes | Out-Null
+    }
+    Write-Log "WinRM enabled"
+    Set-ManagementRuleScope -DisplayGroup "Windows Remote Management"
+} catch {
+    Write-Log ("WinRM configuration failed: " + $_.Exception.Message)
+}
+%{ endif ~}
+
+try {
+    New-Item -ItemType File -Path $RunOnceMarker -Force | Out-Null
+    Write-Log ("Run-once marker written: " + $RunOnceMarker)
+} catch {
+    Write-Log ("Failed to write run-once marker: " + $_.Exception.Message)
+}
+
+Write-ArcLog "=== Azure Arc onboarding end ==="
+if ($arcFailed) {
+    Write-Log ("Cloudbase first-boot script complete, but Azure Arc onboarding failed - see " + $ArcLogPath)
+} else {
+    Write-Log "Cloudbase first-boot script complete"
+}
+
+# The hostname change and one-time autologon above only take effect after a
+# restart. Schedule it after the marker and logs are durable so Cloudbase-Init
+# exits cleanly and the second boot cannot repeat first-boot provisioning.
+Write-Log "Scheduling Windows restart to complete first-boot provisioning"
+try { Stop-Transcript | Out-Null } catch {
+    Write-Log ("Stop-Transcript failed before restart: " + $_.Exception.Message)
+}
+
+$shutdown = Start-Process -FilePath "$env:SystemRoot\System32\shutdown.exe" `
+    -ArgumentList @('/r', '/t', '15', '/f', '/d', 'p:2:4', '/c', 'Completing VM first-boot provisioning') `
+    -Wait -PassThru -WindowStyle Hidden
+if ($shutdown.ExitCode -ne 0) {
+    throw "Failed to schedule Windows restart; shutdown.exe exited with code $($shutdown.ExitCode)"
+}
+
+exit 0

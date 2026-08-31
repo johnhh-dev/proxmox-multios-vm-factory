@@ -1,0 +1,649 @@
+name: terraform-apply
+on:
+  push:
+    branches: [ "main" ]
+    # CHORE-003-A2. Every push to main used to reach the hypervisor, so a typo
+    # fixed in the README planned and applied against the lab. Deny-list rather
+    # than allow-list on purpose: a file added later that nobody thought about
+    # still triggers an apply, which is the safe direction to be wrong in.
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE'
+
+  # A push is not a reliable trigger, and the failure is silent. During the
+  # Actions outage of 2026-08-26 a push to main created a run for checks and no
+  # run at all for this workflow: GitHub never records one, so there is nothing
+  # to re-run once service returns and the commit simply never reaches the lab.
+  # The paths-ignore above has the same shape - a commit that touches only docs
+  # leaves main describing VMs that were never applied. Both cases used to need
+  # an empty commit to recover.
+  #
+  # No inputs, unlike terraform-destroy: this workflow converges the lab on what
+  # main already says, so running it by hand asks for nothing a push would not
+  # have done anyway. It is not a way around the guards either - a dispatched run
+  # joins the same terraform-lab-state concurrency group, needs the same prod
+  # environment, and passes the same inventory safety check.
+  workflow_dispatch:
+
+# CHORE-003-A1/A4. One group, shared with terraform-destroy, because both mutate
+# the same local state file under /opt/terraform-state and neither may interleave
+# with the other. `cancel-in-progress: false` is the point: a second push queues,
+# and an apply already talking to Proxmox is never cancelled mid-flight - a
+# half-applied plan whose state was never written is exactly the orphan-VM case
+# the safety check exists to catch.
+concurrency:
+  group: terraform-lab-state
+  cancel-in-progress: false
+
+# SEC-004-A3: least privilege at the top level, so a step added later inherits
+# a read-only token rather than the repository default. Nothing here writes to
+# the repository - the workflow talks to Proxmox and Azure, not to GitHub.
+permissions:
+  contents: read
+
+jobs:
+  apply:
+    runs-on: [self-hosted, gha-runner-01]
+    environment: prod
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.15.9
+          # BUG-023. The default wrapper is a Node shim that runs the real
+          # binary through @actions/exec and hands it no stdin: the child is
+          # spawned with a pipe nobody writes to and nobody closes. Any
+          # terraform command that reads stdin therefore blocks forever, which
+          # is what the safety check below did on every run - its here-string
+          # went to the shim and stopped there. checks.yml already runs without
+          # the wrapper for the same reason: nothing in this repository reads
+          # its stdout, stderr or exitcode outputs.
+          terraform_wrapper: false
+
+      # BUG-003. See the same step in terraform-plan.yml. This workflow and that
+      # one now derive their variables from one file, so a plan reviewed on a
+      # pull request and the apply of that commit are given the same inputs by
+      # construction rather than by two `env:` blocks agreeing.
+      - uses: ./.github/actions/terraform-env
+        with:
+          secrets: ${{ toJSON(secrets) }}
+          vars: ${{ toJSON(vars) }}
+
+      # SEC-001a. Mints the short-lived Arc onboarding token that replaces the
+      # service-principal secret in the rendered snippet. terraform-plan.yml
+      # calls the same action for the same reason: both render the template, so
+      # both must be given the same shape of input.
+      - uses: ./.github/actions/arc-token
+        with:
+          secrets: ${{ toJSON(secrets) }}
+
+      # SEC-004-A4: no workflow step invokes sudo. The runner account had
+      # passwordless sudo purely to create this directory, which handed every
+      # step on the box a root escalation for the sake of one mkdir. The
+      # directory is now created once during runner provisioning - see
+      # docs/runner-trust-boundary.md - and this step only asserts it is there.
+      - name: Verify Terraform state directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          STATE_DIR=/opt/terraform-state/proxmox-ubuntu-vm-factory
+          if [ ! -d "$STATE_DIR" ]; then
+            echo "::error::$STATE_DIR does not exist. Create it during runner provisioning, owned by the runner account. See docs/runner-trust-boundary.md."
+            exit 1
+          fi
+          if [ ! -w "$STATE_DIR" ]; then
+            echo "::error::$STATE_DIR is not writable by $(id -un). Fix ownership during runner provisioning. See docs/runner-trust-boundary.md."
+            exit 1
+          fi
+          echo "State directory present and writable."
+
+      - run: terraform init -reconfigure
+
+      # FEAT-001-A3. docs/state-recovery.md documents a restore and proves it
+      # works in a drill; its own section 5 then lists "somewhere to restore
+      # *from*" as missing. This is that.
+      #
+      # Placed immediately after init, before anything else touches the
+      # backend. `terraform plan` is not supposed to persist a refreshed state
+      # in a modern Terraform, but the backup costs one file copy and putting
+      # it here removes the need to be right about that.
+      #
+      # It does not make losing the runner's disk survivable - the copy is on
+      # that disk. FEAT-001-A1's remote-backend decision is still open, and it
+      # cannot be closed by adding an upload step here: state holds cleartext
+      # credentials for its whole history, so an unencrypted copy anywhere off
+      # the runner is SEC-002 with a different filename.
+      - name: Back up Terraform state
+        shell: bash
+        run: |
+          set -euo pipefail
+          STATE_DIR=/opt/terraform-state/proxmox-ubuntu-vm-factory
+          python3 .github/scripts/backup_state.py \
+            --state-file "$STATE_DIR/terraform.tfstate" \
+            --backup-dir "$STATE_DIR/backups" \
+            --keep 20 \
+            --label "$GITHUB_RUN_ID"
+
+      # BUG-024. Proxmox keeps every VM configuration in /etc/pve, which is
+      # pmxcfs: a filesystem corosync replicates between nodes and mounts
+      # read-only in any partition that is not quorate. Cloning a VM writes
+      # /etc/pve/nodes/<node>/qemu-server/<vmid>.conf, so an inquorate cluster
+      # rejects the clone whichever node the VM was destined for.
+      #
+      # Terraform cannot see that coming. Run 33074685788 planned three
+      # resources, created the two that do not touch /etc/pve - the Arc marker
+      # and the user-data snippet - and failed the third with a provider-level
+      # `HTTP 500 - cluster not ready - no quorum?`. The state left behind is
+      # consistent but incomplete, and the log says nothing about which node
+      # was missing or what to do about it.
+      #
+      # This does not make an apply survive a node dying halfway through;
+      # nothing here can. It removes the case where the cluster was already
+      # unwritable before the run started, which is the case that happened,
+      # and it costs one GET.
+      - name: Preflight (the cluster can accept writes)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # var.proxmox_endpoint has a default and is not a secret, so it is not
+          # in the TF_VAR set that terraform-env renders. Reading it back from
+          # the configuration keeps one definition rather than repeating the
+          # address here. -input=false and a timeout for the same reasons as the
+          # inventory guard below: a console that blocks should fail the step,
+          # not hold the terraform-lab-state group.
+          rc=0
+          timeout 60 terraform console -no-color -input=false <<<'var.proxmox_endpoint' > endpoint.txt 2> endpoint-err.txt || rc=$?
+          cat endpoint-err.txt >&2 || true
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::could not read var.proxmox_endpoint (terraform console exited $rc)."
+            exit 1
+          fi
+
+          python3 .github/scripts/preflight_cluster.py --endpoint-file endpoint.txt
+      - name: Show Terraform state (debug)
+        shell: bash
+        run: |
+          set +e
+          terraform state list 2>/dev/null
+          echo "(terraform state list exit code=$?)"
+          exit 0
+
+      # BUG-002. This was a grep for `vms\s*=\s*\{\s*\}` against locals.tf.
+      # grep matches within a line and \s does not cross line boundaries, but
+      # local.vms spans dozens of them, so the pattern could never match: an
+      # empty inventory was read as "VMs are desired", the step then demanded a
+      # non-empty state, and a legitimate apply was blocked. The guard was
+      # inverted in practice, and its only escape - TF_BOOTSTRAP=true - turned
+      # the whole check off, including the case it exists to catch.
+      #
+      # Nothing here reads locals.tf as text. `terraform console` hands back the
+      # evaluated inventory, so a commented-out `# vms = {}` cannot satisfy it.
+      # `keys(local.vms)` and not `terraform show -json`: plan JSON carries a
+      # cleartext `variables` block (SEC-002), and it is populated even when the
+      # plan changes nothing - which is exactly the empty-inventory run this
+      # guard is for. See inventory_guard.py for the full reasoning.
+      - name: Safety check (inventory against state)
+        env:
+          TF_BOOTSTRAP: ${{ vars.TF_BOOTSTRAP }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          STATE_FILE=/opt/terraform-state/proxmox-ubuntu-vm-factory/terraform.tfstate
+
+          # BUG-022, corrected by BUG-023. This step hung for the full
+          # six-hour job timeout on every run since it was introduced -
+          # including two whose inventory was empty - and printed nothing at
+          # all while doing so.
+          #
+          # The hang was never a prompt. `setup-terraform` installs a wrapper
+          # shim as `terraform`, and the shim gives the real binary no stdin at
+          # all, so the here-string below reached the shim and stopped there
+          # while `terraform console` waited on a pipe that would never carry
+          # data and never close. BUG-022 read that silence as an unanswerable
+          # -input prompt: the right symptom, the wrong cause. The cause is
+          # fixed by `terraform_wrapper: false` on the setup-terraform step
+          # above. -input=false stays, because a real prompt on a runner with
+          # no terminal should still be a diagnostic and a non-zero exit rather
+          # than a wait.
+          #
+          # The rest of BUG-022 stands on its own and stays. Terraform writes
+          # prompts to stdout and stdout is redirected into
+          # desired-inventory.json, so stderr is captured and echoed explicitly
+          # or the log shows nothing at all; and `timeout` bounds the wait, so a
+          # block of any kind fails the step in two minutes instead of holding
+          # the terraform-lab-state concurrency group, and the single
+          # self-hosted runner behind it, for six hours.
+          #
+          # A here-string rather than `echo |`: the expression is the whole of
+          # stdin either way, but without the pipeline $? is terraform's own
+          # exit code, so the failure is read directly rather than through
+          # pipefail.
+          rc=0
+          timeout 120 terraform console -no-color -input=false <<<'jsonencode(keys(local.vms))' > desired-inventory.json 2> console-err.txt || rc=$?
+          cat console-err.txt >&2 || true
+          if [ "$rc" -ne 0 ]; then
+            if [ "$rc" -eq 124 ]; then
+              echo "::error::terraform console did not finish within 120s. It is blocked, not slow - whatever it printed above is everything it said before the timeout."
+            else
+              echo "::error::terraform console exited $rc without evaluating the inventory."
+            fi
+            exit 1
+          fi
+
+          # An absent state file is a legitimate answer here - the guard is what
+          # decides whether it is an acceptable one.
+          terraform state list > state-list.txt 2>/dev/null || true
+
+          python3 .github/scripts/inventory_guard.py --desired desired-inventory.json --state-list state-list.txt --state-file "$STATE_FILE"
+
+      # SEC-003, the half that was only ever applied to pull requests.
+      #
+      # terraform-plan.yml captures its plan to a file, scans it with
+      # assert_no_secrets.py, and prints it only once it comes back clean. This
+      # workflow printed the same kind of document straight to a job log that
+      # anyone with read access can open, and nothing looked at it.
+      #
+      # sensitive() on the rendered snippet covers the biggest case, and
+      # assert_no_secrets exists because that was judged not to be enough:
+      # BUG-021's whole finding is that a guard has to check the text rather
+      # than trust a mark. The mark was trusted here by omission.
+      #
+      # SECRET_VARS is split on whitespace and commas, so no comment can live
+      # inside the block below - every word in it would be read as a name.
+      - name: Terraform plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          rc=0
+          terraform plan -no-color -input=false -lock-timeout=10m -out=tfplan > apply-plan.txt 2>&1 || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::terraform plan exited $rc. Its output is NOT printed,"
+            echo "::error::because it has not been scanned for credential material."
+            exit "$rc"
+          fi
+
+      - name: Scan the plan before printing it
+        env:
+          SECRET_VARS: |
+            TF_VAR_proxmox_api_token
+            TF_VAR_proxmox_ssh_password
+            TF_VAR_proxmox_ssh_private_key
+            TF_VAR_linux_vm_password
+            TF_VAR_windows_admin_password
+            TF_VAR_arc_sp_secret
+            TF_VAR_arc_sp_id
+            TF_VAR_arc_access_token
+            TF_VAR_arc_tenant_id
+            TF_VAR_arc_subscription_id
+        run: python3 .github/scripts/assert_no_secrets.py apply-plan.txt
+
+      - name: Publish the plan
+        shell: bash
+        run: cat apply-plan.txt
+
+      # BUG-004-A2. The Azure half of this used to live here in full, and the
+      # destroy workflow had no copy at all - which is how it went months
+      # without the cleanup its own README promised. It is a composite action
+      # now, shared with terraform-destroy.yml, so the two paths cannot diverge.
+      - name: Collect Arc machine names from the plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > arc_delete_names.txt
+
+          # Producing tfplan.json is not free: it carries every input variable
+          # in cleartext (SEC-002). Do not write it at all when there is no Arc
+          # credential to act on the result with. The action checks again - it
+          # has to, being reusable - but that check happens after this file
+          # would already exist.
+          if [ -z "${TF_VAR_arc_sp_id:-}" ]; then
+            echo "No Arc credentials configured; not reading the plan."
+            exit 0
+          fi
+
+          terraform show -json tfplan > tfplan.json
+          # No `|| true`: a crashed extractor is not the same answer as "no VMs
+          # are being deleted", and the difference is an orphaned Arc machine.
+          python3 .github/scripts/extract_arc_names_from_plan.py tfplan.json > arc_delete_names.txt
+          rm -f tfplan.json
+
+      - uses: ./.github/actions/arc-cleanup
+        with:
+          names-file: arc_delete_names.txt
+
+      - name: Terraform apply
+        id: apply
+        run: terraform apply -auto-approve -lock-timeout=10m tfplan
+
+      # KAN-017-A5. `terraform apply` succeeding means the provider's API calls
+      # returned. It does not mean a guest booted, and it says nothing at all
+      # about Azure - Arc onboarding happens inside the guest, minutes after
+      # this job has finished. docs/incident-arc-onboarding.md is the runbook
+      # for what that leaves behind, and its first line is that the apply is
+      # green and nothing is red. This is the check that was missing.
+      #
+      # `terraform output -json`, not `terraform show -json`: state and plan
+      # JSON both carry a `variables` block holding every input in cleartext
+      # (SEC-002), and a smoke test has no business producing that file.
+      # Outputs are declared, and vm_inventory holds no secret.
+      #
+      # It runs after the apply, so it reports rather than prevents. That is
+      # what a smoke test is; the preventing is done by the inventory guard and
+      # the cluster preflight, before anything is touched.
+      - name: Post-apply smoke tests
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # `terraform output -json`, not `terraform show -json`: state and plan
+          # JSON both carry a `variables` block holding every input in cleartext
+          # (SEC-002), and a smoke test has no business producing that file.
+          # Outputs are declared, and vm_inventory holds no secret.
+          terraform output -json vm_inventory > vm-inventory.json
+
+          # An absent state file is not an answer this check invents around -
+          # the script treats an unreadable input as exit 2 rather than as
+          # "nothing to check".
+          terraform state list > post-apply-state.txt
+
+          # KAN-017-A5, the third check. #151 shipped the two decidable ones and
+          # left this out rather than add a second `az login` site, which is the
+          # duplication BUG-004 exists to record. The session is now
+          # az_session.sh, shared with arc-cleanup.
+          #
+          # Exit 2 means Arc is not configured for this lab, which is a
+          # legitimate lab. Passing no --arc-present at all is how the script is
+          # told the question was not asked - distinct from asking and finding
+          # nothing, which is a warning.
+          rc=0
+          bash .github/scripts/az_session.sh || rc=$?
+
+          if [ "$rc" -eq 2 ]; then
+            echo "No Arc credentials configured; Azure will not be queried."
+            python3 .github/scripts/postapply_smoke.py \
+              --inventory vm-inventory.json \
+              --state-list post-apply-state.txt
+            exit 0
+          fi
+
+          if [ "$rc" -ne 0 ]; then
+            # Deliberately fatal, where an absent machine is only a warning. A
+            # broken login is not ambiguous and re-running does fix it - and the
+            # destroy path depends on these same credentials to avoid orphaning
+            # Arc machines, so finding out here beats finding out then.
+            echo "::error::Could not authenticate to Azure to verify Arc onboarding. The destroy path uses the same credentials - see docs/arc-cleanup.md."
+            exit "$rc"
+          fi
+
+          # One list call for the whole resource group rather than one show per
+          # machine: fewer calls, and the absent case becomes an ordinary set
+          # difference instead of a 404 to interpret.
+          #
+          # Polled, because a VM created by *this* apply is still booting. The
+          # loop exits as soon as every expected name is present, so a steady
+          # apply pays one call and no wait; only a run that just built an Arc
+          # guest waits at all. The deadline is what this job is willing to hold
+          # the terraform-lab-state concurrency group for - a Windows first boot
+          # that installs an agent and reboots can outlast it, which is why the
+          # script warns rather than fails on whatever is left.
+          #
+          # This compared counts until it was measured. `az resource list`
+          # returns every machine in the resource group, not only the ones this
+          # apply expects - so a group holding three machines from elsewhere
+          # satisfied "found >= expected" on the first iteration while the
+          # machine just built was absent, and the loop exited without waiting
+          # at all. arc_missing.py compares names, through the same parsers the
+          # check itself uses.
+          DEADLINE=$(( SECONDS + 300 ))
+          while : ; do
+            az resource list \
+              --resource-group "$TF_VAR_arc_resource_group" \
+              --resource-type Microsoft.HybridCompute/machines \
+              --query '[].name' -o tsv > arc-present.txt || : > arc-present.txt
+
+            MISSING=$(python3 .github/scripts/arc_missing.py \
+              --inventory vm-inventory.json \
+              --present arc-present.txt)
+
+            if [ "$MISSING" -eq 0 ] || [ "$SECONDS" -ge "$DEADLINE" ]; then
+              break
+            fi
+            echo "arc: $MISSING expected machine(s) not visible yet, waiting..."
+            sleep 30
+          done
+
+          python3 .github/scripts/postapply_smoke.py \
+            --inventory vm-inventory.json \
+            --state-list post-apply-state.txt \
+            --arc-present arc-present.txt
+
+      # BUG-012's shape, which nothing would catch a regression of.
+      #
+      # A plan taken straight after a successful apply should be empty. When it
+      # is not, the configuration does not converge: every push rebuilds
+      # something, and the only symptom is that the lab keeps changing. BUG-012
+      # was exactly this - `vendor_data_file_id` was read off a computed
+      # attribute, so a replaced snippet made the VM unknown at plan time and
+      # every apply destroyed and recreated the guests. Run 33180698859 planned
+      # "3 to destroy" for a merge commit that changed no configuration at all,
+      # and it went unnoticed for months.
+      #
+      # -detailed-exitcode, verified against this Terraform: 0 no changes,
+      # 1 error, 2 changes present.
+      #
+      # This is not ambiguous the way an absent Arc machine is, so it fails
+      # rather than warns. Like the smoke tests above it reports rather than
+      # prevents - the apply has already happened - and the message says so, so
+      # nobody reads a red run here as "the apply did not land".
+      #
+      # The token minted for this run (SEC-001a) is in the job environment, so
+      # this plan renders the same vendor-data the apply just wrote. A diff here
+      # is a real one.
+      # OPS-004 (#176). The check that was missing. The smoke test above asks
+      # whether the VM exists and answers through the guest agent - both true of
+      # a guest whose first-boot document never ran, which is how VM 101 spent
+      # days with no administrator password, no RDP, no DNS and no Arc while
+      # five merged pull requests were believed to have taken effect.
+      #
+      # It asks the guest instead, through agent/file-read. Warns rather than
+      # fails, for the same reason the Arc check does - but a guest that *cannot*
+      # run its first-boot document warns on every apply, forever, rather than
+      # intermittently.
+      # This and the step below run whenever the *apply* succeeded, whatever the
+      # checks between here and it did. All three are after the fact - the apply
+      # has happened and none of them rolls it back - so stopping at the first
+      # means an operator learns one finding per apply cycle, and on a lab where
+      # an apply builds guests that is an expensive way to be told two things.
+      #
+      # Conditioned on steps.apply rather than a bare always(), and the
+      # difference matters: with always() these would also run after a *failed*
+      # apply, where vm-inventory.json was never written - turning one failure
+      # into three, two of them noise about a missing file.
+      #
+      # It does not weaken the gate. Each still fails the job on its own; they
+      # stop queueing behind each other.
+      - name: First boot actually ran
+        if: always() && steps.apply.outcome == 'success' 
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Read from the job environment rather than a YAML `env:` block: a
+          # `${...}` there is a literal string, not an expansion. terraform-env
+          # puts the TF_VAR_* set here (BUG-003), and the step that collects Arc
+          # names reads them the same way.
+          export PROXMOX_API_TOKEN="${TF_VAR_proxmox_api_token:-}"
+
+          # The endpoint and node have defaults in variables.tf and are not
+          # secrets, so they are only in the environment when a repository
+          # variable set them (KAN-012). Fall back to what the preflight step
+          # already read out of the configuration.
+          ENDPOINT="${TF_VAR_proxmox_endpoint:-}"
+          if [ -z "$ENDPOINT" ] && [ -s endpoint.txt ]; then
+            ENDPOINT=$(tr -d '"[:space:]' < endpoint.txt)
+          fi
+
+          ARGS=()
+          # Follow the same setting the provider does rather than hardcoding it,
+          # or this check would keep skipping verification after SEC-006-A1
+          # turns validation on.
+          if [ "${TF_VAR_proxmox_tls_insecure:-true}" = "true" ]; then
+            ARGS+=(--insecure)
+          fi
+
+          python3 .github/scripts/verify_first_boot.py \
+            --inventory vm-inventory.json \
+            --endpoint "$ENDPOINT" \
+            --node "${TF_VAR_proxmox_node_name:-pve}" "${ARGS[@]}"
+
+      # SEC-001e-A1 (#120): "confirm what the current state actually contains,
+      # and record which credentials appear." That was written as a one-off for
+      # a person on the runner, and audit_state_secrets.py was built for them -
+      # check_ci_wiring.py records the reasoning, that supplying the inputs over
+      # SSH would put a credential on a command line.
+      #
+      # That reasoning holds for an operator typing the command and does not
+      # hold here. The credentials are already in this job's environment,
+      # rendered by the terraform-env action into $GITHUB_ENV; the state file is
+      # on this machine; nothing is typed and no command line carries a value.
+      # So the case the decision did not consider is the cheapest place to run
+      # it, and running it once by hand answers a question that changes on every
+      # apply.
+      #
+      # It reports rather than blocks, and the exit codes are why:
+      #
+      #   1  findings, which are expected before SEC-001e's purge - the API
+      #      token, the node SSH credential and the Windows password land in
+      #      state on every apply, so failing here would fail every apply for a
+      #      known and recorded reason.
+      #   2  nothing could be scanned. That fails, because a scan that did not
+      #      run must never be mistaken for a clean one.
+      #   0  the acceptance criterion. When this is durably 0, the warning below
+      #      becomes `exit 1` and SEC-001e has a gate rather than a report.
+      #
+      # The list is the six credentials, and deliberately not arc_sp_id,
+      # arc_tenant_id or arc_subscription_id: those are identifiers the
+      # configuration renders into the snippet on purpose, so including them
+      # would bury the two rows that matter under three that always match.
+      #
+      # linux_vm_password and arc_sp_secret stopped landing in state (#127,
+      # #122). They are scanned anyway - a standing check exists to notice a
+      # value coming back, and those two are the ones with a fix to regress.
+      - name: What this apply left in state
+        shell: bash
+        env:
+          SECRET_VARS: |
+            TF_VAR_proxmox_api_token
+            TF_VAR_proxmox_ssh_password
+            TF_VAR_linux_vm_password
+            TF_VAR_windows_admin_password
+            TF_VAR_arc_sp_secret
+            TF_VAR_arc_access_token
+        run: |
+          set -uo pipefail
+          STATE_DIR=/opt/terraform-state/proxmox-ubuntu-vm-factory
+
+          rc=0
+          python3 .github/scripts/audit_state_secrets.py "$STATE_DIR" || rc=$?
+
+          case "$rc" in
+            0)
+              echo "::notice::No scanned credential appears in the state file or"
+              echo "::notice::its backups. That is SEC-001e's acceptance"
+              echo "::notice::criterion - see docs/adr/0004-terraform-state.md."
+              ;;
+            1)
+              echo "::warning::Credentials appear in Terraform state, named"
+              echo "::warning::above. Expected before SEC-001e (#120); this"
+              echo "::warning::step reports it rather than failing the apply."
+              echo "::warning::It scans only the values this job holds, so a"
+              echo "::warning::rotated-out credential is invisible to it - that"
+              echo "::warning::half is still a person's, per SEC-001e-A4."
+              ;;
+            *)
+              echo "::error::The state audit could not run (exit $rc). Not"
+              echo "::error::scanning is not the same as finding nothing."
+              exit 1
+              ;;
+          esac
+
+      - name: The applied configuration converges
+        if: always() && steps.apply.outcome == 'success'
+        shell: bash
+        env:
+          SECRET_VARS: |
+            TF_VAR_proxmox_api_token
+            TF_VAR_proxmox_ssh_password
+            TF_VAR_proxmox_ssh_private_key
+            TF_VAR_linux_vm_password
+            TF_VAR_windows_admin_password
+            TF_VAR_arc_sp_secret
+            TF_VAR_arc_sp_id
+            TF_VAR_arc_access_token
+            TF_VAR_arc_tenant_id
+            TF_VAR_arc_subscription_id
+        run: |
+          set -euo pipefail
+
+          rc=0
+          terraform plan -detailed-exitcode -input=false -no-color -lock-timeout=10m > post-apply-plan.txt || rc=$?
+
+          if [ "$rc" -eq 0 ]; then
+            echo "No changes after apply - the configuration converges."
+            exit 0
+          fi
+
+          if [ "$rc" -eq 1 ]; then
+            echo "::error::The post-apply plan failed to run. This is not a"
+            echo "::error::convergence failure - read the output below."
+            if python3 .github/scripts/assert_no_secrets.py post-apply-plan.txt; then
+              cat post-apply-plan.txt
+            else
+              echo "::error::...except it is not printed, because it did not"
+              echo "::error::pass the credential scan. Read it on the runner."
+            fi
+            exit 1
+          fi
+
+          echo "::error::The configuration does not converge: a plan taken"
+          echo "::error::immediately after this apply still proposes changes."
+          echo "::error::Every future push will keep applying them. The apply"
+          echo "::error::itself succeeded and nothing here rolls it back."
+
+          # Scanned before it is printed, for the same reason the plan above is.
+          # This step used to `cat` a plan document straight into the job log on
+          # its failure path - which is the one path where a reader most wants
+          # to see it, and the one where nobody was looking at what it said.
+          if python3 .github/scripts/assert_no_secrets.py post-apply-plan.txt; then
+            cat post-apply-plan.txt
+          else
+            echo "::error::The plan is NOT printed: it did not pass the"
+            echo "::error::credential scan. Read it on the runner instead."
+          fi
+          exit 1
+
+      # Do NOT add tfplan or tfplan.json here. `terraform show -json` emits a
+      # `variables` block holding every input variable in cleartext - the Arc
+      # service-principal secret, the Proxmox API token, the Proxmox root SSH
+      # password and both guest admin passwords. `sensitive = true` does not
+      # redact it, and the block is populated even when the plan changes nothing.
+      # arc_delete_names.txt holds only Arc machine names and is safe to keep.
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: apply-debug-${{ github.run_id }}
+          if-no-files-found: ignore
+          path: |
+            arc_delete_names.txt
+
+      # Plan files carry the same cleartext credentials as above. Remove them so
+      # a cancelled or failed run does not leave them on the self-hosted runner.
+      # The inventory guard's working files hold only VM names and resource
+      # addresses, but they are this job's litter too and go the same way.
+      - name: Remove working files from the runner workspace
+        if: always()
+        shell: bash
+        run: rm -f tfplan tfplan.json desired-inventory.json state-list.txt console-err.txt vm-inventory.json post-apply-state.txt arc-present.txt post-apply-plan.txt apply-plan.txt

@@ -1,0 +1,59 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+
+# Plan and state output holds every credential in cleartext.
+#
+# `terraform show -json <planfile>` emits a `variables` block containing the
+# value of every input variable - the Arc service-principal secret, the Proxmox
+# API token, the Proxmox root SSH password and both guest admin passwords.
+# `sensitive = true` marks CLI output, not the JSON representation, so it
+# redacts nothing here, and the block is populated even when the plan changes
+# nothing at all.
+#
+# State output carries a different but equally sensitive payload: the rendered
+# cloud-init snippet in `source_raw.data`, which embeds the same credentials.
+#
+# Verified 2026-08-22 against a real build artifact. See issue #34 (SEC-002).
+tfplan
+tfplan.json
+tfstate.json
+arc_delete_names.txt
+
+# Variable files
+*.tfvars
+*.tfvars.json
+!example.tfvars
+
+# Claude Code
+# settings.local.json is per-machine and never shared. settings.json *can* be
+# committed to share a permission allowlist with a team - delete the second
+# line below if you ever want that. Today it holds only one-off permissions
+# accumulated during a working session, which are not worth sharing.
+.claude/settings.local.json
+.claude/settings.json
+
+# Editor / OS
+# .vscode/* rather than .vscode/: git does not descend into an excluded
+# directory, so a `!` negation below cannot re-include anything unless the
+# directory itself stays walkable. Two files are shared on purpose and the rest
+# of the directory stays local. settings.json formats .tf on save;
+# extensions.json recommends the extension that setting names as its formatter,
+# which is inert without it. Both are conveniences - the fmt gate is the
+# terraform job in checks.yml, which does not depend on anyone's editor.
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Python
+# The scripts in .github/scripts are run as `python3 <file>`, but the test
+# suites import two of them, and an import writes bytecode next to the source.
+__pycache__/
+*.pyc
