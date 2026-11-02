@@ -16,7 +16,7 @@ terraform {
       # plan. `~> 0.111.0` accepts 0.111.x patch releases and nothing further;
       # .terraform.lock.hcl fixes the exact version and its checksums on top.
       # Widening the minor is a deliberate edit, reviewed like any other.
-      version = "~> 0.111.0"
+      version = "~> 0.119.0"
     }
   }
 }
